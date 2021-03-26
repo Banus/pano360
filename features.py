@@ -1,11 +1,92 @@
 """Extract and match features."""
+import math
 import os
 import numpy as np
 
 import scipy.ndimage as ndi
 import cv2
 
-DSIZE = 7  # descriptor size
+DSIZE = 8  # descriptor size
+
+
+def gaussian_filter(img, sigma=1.0):
+    """Computes the kernel size from sigma and smooths the image."""
+    ksz = min(int((sigma - 0.35) / 0.15), 1)
+    ksz += not (ksz % 2)  # must be odd
+    return cv2.GaussianBlur(img, (ksz, ksz), sigma, sigma)
+
+
+# from: https://github.com/BAILOOL/ANMS-Codes/blob/master/Python/demo.py
+def ssc(keypoints, im_size, n_points, tol=0.1):
+    """Fast Adaptive Non-Maxima Suppression, from:
+
+    Bailo, Oleksandr, et al. "Efficient adaptive non-maximal suppression
+    algorithms for homogeneous spatial keypoint distribution."
+    Pattern Recognition Letters 106 (2018): 53-60.
+    """
+    cols, rows = im_size
+    exp1 = rows + cols + 2 * n_points
+    exp2 = (4 * cols
+            + 4 * n_points
+            + 4 * rows * n_points
+            + rows * rows
+            + cols * cols
+            - 2 * rows * cols
+            + 4 * rows * cols * n_points)
+    exp3 = math.sqrt(exp2)
+    exp4 = n_points - 1
+
+    sol1 = -round(float(exp1 + exp3) / exp4)  # first solution
+    sol2 = -round(float(exp1 - exp3) / exp4)  # second solution
+
+    # binary search range initialization with positive solution
+    high = max(sol1, sol2)
+    low = math.floor(math.sqrt(len(keypoints) / n_points))
+
+    prev_width, complete, k = -1, False, n_points
+    result_list, result = [], []
+    k_min, k_max = round(k - (k * tol)), round(k + (k * tol))
+
+    while not complete:
+        width = low + (high - low) / 2
+        # avoid repeating the same radius twice
+        if (width == prev_width or low > high):
+            # return the keypoints from the previous iteration
+            result_list = result
+            break
+
+        c = width / 2  # initializing the grid
+        num_cell_cols = int(math.floor(cols / c))
+        num_cell_rows = int(math.floor(rows / c))
+        covered_vec = [[False for _ in range(num_cell_cols + 1)]
+                       for _ in range(num_cell_rows + 1)]
+
+        result = []
+        for i, kpt in enumerate(keypoints):
+            # get position of the cell current point is located at
+            row, col = int(math.floor(kpt[1] / c)), int(math.floor(kpt[0] / c))
+            if not covered_vec[row][col]:  # if the cell is not covered
+                result.append(i)
+                # get range which current radius is covering
+                row_min = int(max(row - math.floor(width / c), 0))
+                row_max = int(min(row + math.floor(width / c), num_cell_rows))
+                col_min = int(max(col - math.floor(width / c), 0))
+                col_max = int(min(col + math.floor(width / c), num_cell_cols))
+                # cover cells within the square bounding box with width w
+                for row_to_cover in range(row_min, row_max + 1):
+                    for col_to_cover in range(col_min, col_max + 1):
+                        if not covered_vec[row_to_cover][col_to_cover]:
+                            covered_vec[row_to_cover][col_to_cover] = True
+
+        if k_min <= len(result) <= k_max:  # solution found
+            result_list, complete = result, True
+        elif len(result) < k_min:
+            high = width - 1  # update binary search range
+        else:
+            low = width + 1
+        prev_width = width
+
+    return [keypoints[res] for res in result_list]
 
 
 def rot_mat(theta, pp_):
@@ -18,8 +99,9 @@ def rot_mat(theta, pp_):
 def descriptors(src, xx_, yy_, scale):
     """Get oriented MSOP descriptors."""
     points, desc = [], []
-    g_x = cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=5)
-    g_y = cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=5)
+    g_x = gaussian_filter(cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=3))
+    g_y = gaussian_filter(cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=3))
+    blurred = gaussian_filter(src, 2.0)
 
     for pp_ in zip(xx_, yy_):
         theta = np.arctan2(g_x[pp_], g_y[pp_])
@@ -27,7 +109,7 @@ def descriptors(src, xx_, yy_, scale):
 
         rmat = np.linalg.inv(rot_mat(theta, pp_))
         rmat[:2, 2] += DSIZE / 2  # center patch
-        tile = cv2.warpPerspective(src, rmat, (DSIZE, DSIZE),
+        tile = cv2.warpPerspective(blurred, rmat, (DSIZE, DSIZE),
                                    flags=cv2.INTER_LINEAR)
         desc.append(tile.astype("uint8"))
 
@@ -41,13 +123,18 @@ def msop(img, max_feat=(500, 50, 25, 10)):
 
     for lvl, maxf in enumerate(max_feat):
         # neighborhood size, Sobel aperture and trace coefficient
-        dst = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
+        hrs = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
 
-        loc_max = np.where(ndi.maximum_filter(dst, size=3) == dst)
-        idx = np.argsort(dst[loc_max])[-maxf:]
+        loc_max = np.where(ndi.maximum_filter(hrs, size=3) == hrs)
+        idx = np.argsort(hrs[loc_max])[-maxf*20:]  # slack for radii selection
 
         x_lvl, y_lvl = loc_max
-        pts, dsc = descriptors(gray, x_lvl[idx], y_lvl[idx], 2**lvl)
+        x_lvl, y_lvl = x_lvl[idx], y_lvl[idx]
+
+        pts = ssc(np.stack([x_lvl, y_lvl], axis=1), gray.shape, maxf)
+        x_lvl, y_lvl = np.stack(pts, axis=1)
+
+        pts, dsc = descriptors(gray, x_lvl, y_lvl, 2**lvl)
         points.append(pts)
         descs.append(dsc)
 
