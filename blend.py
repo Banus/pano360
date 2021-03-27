@@ -40,24 +40,33 @@ def warp(img, kint, spherical=True):
                      borderMode=cv2.BORDER_TRANSPARENT)
 
 
-def alpha_blend(img1, img2):
+def alpha_blend(img1, img2, mask=None):
     """Blend using an alpha ramp."""
-    delta = img1.shape[1]
-    blend_mask = np.linspace(1, 0, delta).reshape((1, delta, 1))
-    return (img1[:, -delta:]*blend_mask + img2[:, :delta]*(1-blend_mask))\
-        .astype("uint8")
+    if mask is None:
+        delta = img1.shape[1]
+        mask = np.linspace(1, 0, delta).reshape((1, delta, 1))
+    return (img1*mask + img2*(1-mask)).astype("uint8")
 
 
-def graph_cut(img1, img2):
+def graph_cut(img1, img2, shrink=5):
     # pylint: disable=too-many-locals
-    """Blend two images using graph cuts."""
+    """Blend two images using graph cuts with optional downsampling."""
     dd_ = [[0, 1], [0, -1], [1, 0], [-1, 0]]
-    rows, cols = img1.shape[:2]
 
     diff = np.max(np.abs(img1 - img2), axis=2)
-    mask = np.zeros(img1.shape[:2], dtype=np.int32)
+    if img1.shape[2] == 4:  # borders are low priority
+        diff[img1[:, :, 3] == 0], diff[img2[:, :, 3] == 0] = -1, -1
+    if shrink > 1:
+        # when subsampling, the weakest difference matters
+        hh_, ww_ = diff.shape
+        hh_, ww_ = hh_ // shrink, ww_ // shrink
+        diff = diff[:shrink*hh_, :shrink*ww_]
+        diff = np.min(diff.reshape(hh_, shrink, ww_, shrink), axis=(1, 3))
 
-    qq_, border = [], 14
+    mask = np.zeros(diff.shape, dtype=np.int32)
+    rows, cols = mask.shape[:2]
+
+    qq_, border = [], int(13/shrink) + 1
     mask[:, :border] = -1
     mask[:, -border+1:] = 1
 
@@ -82,9 +91,48 @@ def graph_cut(img1, img2):
             if mask[ny_, nx_] == 0:
                 heapq.heappush(qq_, (-diff[ny_, nx_], clr, nx_, ny_))
 
-    blended = img1.copy()
-    blended[mask == 1] = img2[mask == 1]
-    return blended, ((mask + 1) * 128 - 1).astype("uint8")
+    mask = cv2.resize((mask == -1).astype("float32"), img1.shape[:2][::-1])
+    return (mask[..., None]*255).astype("uint8")
+
+
+# adapted from: https://docs.opencv.org/3.0-beta/doc/py_tutorials/py_imgproc/
+#   py_pyramids/py_pyramids.html
+def laplacian_blending(img1, img2, mask=None, n_levels=6):
+    """Use a Laplacian pyramid on the images for blending."""
+    if mask is None:
+        hh_, ww_, cc_ = img1.shape
+        mask = np.linspace(1, -1, ww_).reshape((1, ww_, 1))
+        mask = 1.0 / (1 + np.exp(-100 * mask))  # sigmoid
+        mask = np.tile(mask, (hh_, 1, cc_))
+
+    if mask.shape[2] == 1:
+        mask = np.repeat(mask, img1.shape[2], axis=2)
+
+    def _gassian_pyr(img):
+        pyr = [img]
+        for _ in range(n_levels):
+            img = cv2.pyrDown(img)
+            pyr.append(img)
+        return pyr
+
+    def _laplacian_pyr(img):
+        pyr = _gassian_pyr(img)
+        lap = [pyr[-1]]
+        for idx in range(n_levels, 0, -1):
+            im_ = pyr[idx-1]
+            lap.append(im_ - cv2.pyrUp(pyr[idx])[:im_.shape[0], :im_.shape[1]])
+        return lap
+
+    pyr1 = _laplacian_pyr(img1.astype("float32"))
+    pyr2 = _laplacian_pyr(img2.astype("float32"))
+    pyrm = _gassian_pyr(mask)[::-1]
+
+    pyrs = [la * gm + lb * (1.0 - gm) for la, lb, gm in zip(pyr1, pyr2, pyrm)]
+    blended = pyrs[0]
+    for ls_ in pyrs[1:]:
+        blended = ls_ + cv2.pyrUp(blended)[:ls_.shape[0], :ls_.shape[1]]
+
+    return np.clip(blended, 0, 255).astype("uint8")
 
 
 def main():
@@ -98,10 +146,11 @@ def main():
 
     # intrinsics
     intr = np.array([[foc, 0, width/2], [0, foc, height/2], [0, 0, 1]])
-    # img1, img2 = warp(img1, intr), warp(img2, intr)
+    img1, img2 = warp(img1, intr), warp(img2, intr)
 
-    # overlap, _ = graph_cut(img1[:, -delta:], img2[:, :delta])
-    overlap = alpha_blend(img1[:, -delta:], img2[:, :delta])
+    mask = graph_cut(img1[:, -delta:], img2[:, :delta])
+    overlap = laplacian_blending(
+        img1[:, -delta:], img2[:, :delta], mask / 255.0)
 
     blended = np.concatenate(
         [img1[:, :-delta], overlap.astype("uint8"), img2[:, delta:]], axis=1)
