@@ -1,5 +1,7 @@
 """Warps and blend images."""
 import os
+import heapq
+
 import numpy as np
 import cv2
 
@@ -38,6 +40,53 @@ def warp(img, kint, spherical=True):
                      borderMode=cv2.BORDER_TRANSPARENT)
 
 
+def alpha_blend(img1, img2):
+    """Blend using an alpha ramp."""
+    delta = img1.shape[1]
+    blend_mask = np.linspace(1, 0, delta).reshape((1, delta, 1))
+    return (img1[:, -delta:]*blend_mask + img2[:, :delta]*(1-blend_mask))\
+        .astype("uint8")
+
+
+def graph_cut(img1, img2):
+    # pylint: disable=too-many-locals
+    """Blend two images using graph cuts."""
+    dd_ = [[0, 1], [0, -1], [1, 0], [-1, 0]]
+    rows, cols = img1.shape[:2]
+
+    diff = np.max(np.abs(img1 - img2), axis=2)
+    mask = np.zeros(img1.shape[:2], dtype=np.int32)
+
+    qq_, border = [], 14
+    mask[:, :border] = -1
+    mask[:, -border+1:] = 1
+
+    for yy_ in range(rows):
+        qq_ += [(-1e3, -1, border, yy_), (-1e3, 1, cols-border, yy_)]
+    heapq.heapify(qq_)
+
+    while True:
+        try:
+            _, clr, xx_, yy_ = heapq.heappop(qq_)
+        except IndexError:
+            break
+
+        if mask[yy_, xx_] != 0:
+            continue
+        mask[yy_, xx_] = clr
+
+        for dx_, dy_ in dd_:
+            nx_, ny_ = xx_ + dx_, yy_ + dy_
+            if not(0 <= nx_ < cols and 0 <= ny_ < rows):
+                continue
+            if mask[ny_, nx_] == 0:
+                heapq.heappush(qq_, (-diff[ny_, nx_], clr, nx_, ny_))
+
+    blended = img1.copy()
+    blended[mask == 1] = img2[mask == 1]
+    return blended, ((mask + 1) * 128 - 1).astype("uint8")
+
+
 def main():
     """Script entry point."""
     base_path = "../data/ppwwyyxx/CMU2"
@@ -45,13 +94,15 @@ def main():
     img2 = cv2.imread(os.path.join(base_path, "medium00.JPG"))
 
     height, width = img1.shape[:2]
-    foc, delta = 3e3, 975
+    foc, delta = 3e3, 976
+
     # intrinsics
     intr = np.array([[foc, 0, width/2], [0, foc, height/2], [0, 0, 1]])
+    # img1, img2 = warp(img1, intr), warp(img2, intr)
 
-    img1, img2 = warp(img1, intr), warp(img2, intr)
-    blend_mask = np.linspace(1, 0, delta).reshape((1, delta, 1))
-    overlap = (img1[:, -delta:]*blend_mask + img2[:, :delta]*(1-blend_mask))
+    # overlap, _ = graph_cut(img1[:, -delta:], img2[:, :delta])
+    overlap = alpha_blend(img1[:, -delta:], img2[:, :delta])
+
     blended = np.concatenate(
         [img1[:, :-delta], overlap.astype("uint8"), img2[:, delta:]], axis=1)
 
