@@ -10,83 +10,85 @@ DSIZE = 8  # descriptor size
 
 
 def gaussian_filter(img, sigma=1.0):
-    """Computes the kernel size from sigma and smooths the image."""
-    ksz = min(int((sigma - 0.35) / 0.15), 1)
-    ksz += not (ksz % 2)  # must be odd
+    """Compute the kernel size from sigma and smooths the image."""
+    ksz = max(int((sigma - 0.35) / 0.15), 1)
+    ksz += not ksz % 2  # must be odd
     return cv2.GaussianBlur(img, (ksz, ksz), sigma, sigma)
 
 
-# from: https://github.com/BAILOOL/ANMS-Codes/blob/master/Python/demo.py
+# from: https://github.com/BAILOOL/ANMS-Codes/blob/master/Python/ssc.py
 def ssc(keypoints, im_size, n_points, tol=0.1):
-    """Fast Adaptive Non-Maxima Suppression, from:
+    # pylint: disable=too-many-locals
+    """Fast Adaptive Non-Maxima Suppression [1].
 
-    Bailo, Oleksandr, et al. "Efficient adaptive non-maximal suppression
+    [1] Bailo, Oleksandr, et al. "Efficient adaptive non-maximal suppression
     algorithms for homogeneous spatial keypoint distribution."
     Pattern Recognition Letters 106 (2018): 53-60.
     """
     cols, rows = im_size
-    exp1 = rows + cols + 2 * n_points
-    exp2 = (4 * cols
-            + 4 * n_points
-            + 4 * rows * n_points
-            + rows * rows
-            + cols * cols
-            - 2 * rows * cols
-            + 4 * rows * cols * n_points)
-    exp3 = math.sqrt(exp2)
-    exp4 = n_points - 1
 
-    sol1 = -round(float(exp1 + exp3) / exp4)  # first solution
-    sol2 = -round(float(exp1 - exp3) / exp4)  # second solution
+    def _high():
+        """Top range for binary search."""
+        exp1 = rows + cols + 2 * n_points
+        exp2 = (4 * cols
+                + 4 * n_points
+                + 4 * rows * n_points
+                + rows * rows
+                + cols * cols
+                - 2 * rows * cols
+                + 4 * rows * cols * n_points)
+        exp3 = math.sqrt(exp2)
+        exp4 = n_points - 1
 
-    # binary search range initialization with positive solution
-    high = max(sol1, sol2)
+        sol1 = -round(float(exp1 + exp3) / exp4)  # first solution
+        sol2 = -round(float(exp1 - exp3) / exp4)  # second solution
+
+        return max(sol1, sol2)
+
+    # binary search range initialization with positive solutions
+    high = _high()
     low = math.floor(math.sqrt(len(keypoints) / n_points))
 
     prev_width, complete, k = -1, False, n_points
-    result_list, result = [], []
     k_min, k_max = round(k - (k * tol)), round(k + (k * tol))
 
+    result = []
     while not complete:
         width = low + (high - low) / 2
         # avoid repeating the same radius twice
         if (width == prev_width or low > high):
             # return the keypoints from the previous iteration
-            result_list = result
             break
 
-        c = width / 2  # initializing the grid
-        num_cell_cols = int(math.floor(cols / c))
-        num_cell_rows = int(math.floor(rows / c))
-        covered_vec = [[False for _ in range(num_cell_cols + 1)]
-                       for _ in range(num_cell_rows + 1)]
+        cgr = width / 2  # initializing the grid
+        n_cell_cols = int(math.floor(cols / cgr))
+        n_cell_rows = int(math.floor(rows / cgr))
+        covered_vec = np.full((n_cell_rows+1, n_cell_cols+1), False)
 
         result = []
         for i, kpt in enumerate(keypoints):
             # get position of the cell current point is located at
-            row, col = int(math.floor(kpt[1] / c)), int(math.floor(kpt[0] / c))
+            row = int(math.floor(kpt[1] / cgr))
+            col = int(math.floor(kpt[0] / cgr))
             if not covered_vec[row][col]:  # if the cell is not covered
                 result.append(i)
                 # get range which current radius is covering
-                row_min = int(max(row - math.floor(width / c), 0))
-                row_max = int(min(row + math.floor(width / c), num_cell_rows))
-                col_min = int(max(col - math.floor(width / c), 0))
-                col_max = int(min(col + math.floor(width / c), num_cell_cols))
+                row_min = int(max(row - math.floor(width / cgr), 0))
+                row_max = int(min(row + math.floor(width / cgr), n_cell_rows))
+                col_min = int(max(col - math.floor(width / cgr), 0))
+                col_max = int(min(col + math.floor(width / cgr), n_cell_cols))
                 # cover cells within the square bounding box with width w
-                for row_to_cover in range(row_min, row_max + 1):
-                    for col_to_cover in range(col_min, col_max + 1):
-                        if not covered_vec[row_to_cover][col_to_cover]:
-                            covered_vec[row_to_cover][col_to_cover] = True
+                covered_vec[row_min:row_max+1, col_min:col_max+1] = True
 
         if k_min <= len(result) <= k_max:  # solution found
-            result_list, complete = result, True
+            complete = True
         elif len(result) < k_min:
             high = width - 1  # update binary search range
         else:
             low = width + 1
         prev_width = width
 
-    return [keypoints[res] for res in result_list]
+    return [keypoints[res] for res in result]
 
 
 def rot_mat(theta, pp_):
@@ -158,7 +160,7 @@ def plot_points(img, points):
 
 
 def plot_descs(descs, side=25):
-    """Plots the first 100 descriptors."""
+    """Plot the first 100 descriptors."""
     n_tiles = side * side
     if len(descs) < n_tiles:
         pad = np.zeros(
