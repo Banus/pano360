@@ -3,6 +3,14 @@ import os
 import heapq
 
 import numpy as np
+import scipy.sparse as ssp
+
+try:
+    # ~6x faster than scipy
+    from pypardiso import spsolve  # type: ignore (pylance bug)
+except ImportError:
+    from scipy.sparse.linalg import spsolve
+
 import cv2
 
 
@@ -135,6 +143,69 @@ def laplacian_blending(img1, img2, mask=None, n_levels=6):
     return np.clip(blended, 0, 255).astype("uint8")
 
 
+def poisson_matrix(x_max, y_max, positions=None):
+    """Create a Poisson matrix with mask positions."""
+    n_pix = x_max * y_max
+    zeros = np.arange(1, y_max+1) * x_max - 1
+
+    if positions is None:
+        diagonals = [np.full(n_pix, 4)] + [-np.ones(n_pix)] * 4
+        diagonals[1][zeros] = 0
+        diagonals[2][zeros] = 0
+        return ssp.spdiags(diagonals, [0, -1, 1, -x_max, x_max], n_pix, n_pix,
+                           'csr').tocsc()
+
+    main_diagonal = np.ones(n_pix)
+    main_diagonal[positions] = 4
+    diagonals = [main_diagonal]
+    diagonals_positions = [0]
+
+    # creating the diagonals of the coefficient matrix
+    for diagonal_pos in [-1, 1, -x_max, x_max]:
+        in_bounds_positions = positions[((positions + diagonal_pos) >= 0) &
+                                        ((positions + diagonal_pos) < n_pix)]
+
+        diagonal = np.zeros(n_pix)
+        diagonal[in_bounds_positions + diagonal_pos] = -1
+        if diagonal_pos in (-1, 1):
+            diagonal[zeros] = 0
+        diagonals.append(diagonal)
+        diagonals_positions.append(diagonal_pos)
+
+    return ssp.spdiags(diagonals, diagonals_positions, n_pix, n_pix, 'csr')
+
+
+# from: https://github.com/fbessho/PyPoi/blob/master/pypoi/poissonblending.py
+def poisson_blend(img_source, img_target, img_mask):
+    """Combine images using Poisson editing."""
+    x_max, y_max = img_source.shape[1], img_source.shape[0]
+    img_mask = img_mask != 0
+
+    # determines the diagonals on the coefficient matrix - flattened
+    positions = np.where(img_mask)
+    positions = (positions[0] * x_max) + positions[1]
+
+    mat_a = poisson_matrix(x_max, y_max, positions)
+    pois = poisson_matrix(x_max, y_max)
+
+    # get positions in mask that should be taken from the target
+    positions_from_target = np.where((~img_mask).flatten())[0]
+
+    # for each layer (ex. RGB)
+    for num_layer in range(img_target.shape[2]):
+        tgt = img_target[..., num_layer].flatten()
+        src = img_source[..., num_layer].flatten()
+
+        mat_b = pois * src
+        mat_b[positions_from_target] = tgt[positions_from_target]
+        sol = spsolve(mat_a, mat_b)
+
+        sol = np.clip(sol.reshape((y_max, x_max)), 0, 255)
+        img_target[..., num_layer] = np.array(sol, img_target.dtype)
+
+    return img_target
+
+
 def main():
     """Script entry point."""
     base_path = "../data/ppwwyyxx/CMU2"
@@ -149,13 +220,16 @@ def main():
     img1, img2 = warp(img1, intr), warp(img2, intr)
 
     mask = graph_cut(img1[:, -delta:], img2[:, :delta])
-    overlap = laplacian_blending(
-        img1[:, -delta:], img2[:, :delta], mask / 255.0)
+
+    overlap = poisson_blend(img1[:, -delta:], img2[:, :delta], mask > 127)
+    # overlap = laplacian_blending(
+    #     img1[:, -delta:], img2[:, :delta], mask / 255.0)
 
     blended = np.concatenate(
         [img1[:, :-delta], overlap.astype("uint8"), img2[:, delta:]], axis=1)
 
     cv2.imshow('blend', blended)
+
     if cv2.waitKey(0) & 0xff == 27:
         cv2.destroyAllWindows()
 
