@@ -1,4 +1,7 @@
-"""Extract and match features."""
+"""Extract and match features.
+
+Loosely based on: https://momohuang.github.io/Panorama/
+"""
 import math
 import os
 import numpy as np
@@ -113,12 +116,16 @@ def descriptors(src, xx_, yy_, scale):
         rmat[:2, 2] += DSIZE / 2  # center patch
         tile = cv2.warpPerspective(blurred, rmat, (DSIZE, DSIZE),
                                    flags=cv2.INTER_LINEAR)
-        desc.append(tile.astype("uint8"))
+        desc.append(tile.flatten())
+
+    desc = np.array(desc)    # normalize
+    desc = (desc - np.mean(desc, axis=1, keepdims=True)) / (
+        np.std(desc, axis=1, keepdims=True) + 1e-8)
 
     return points, desc
 
 
-def msop(img, max_feat=(500, 50, 25, 10)):
+def msop(img, max_feat=(5000, 100, 25, 10)):
     """Extract MSOP features."""
     gray = np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
     points, descs = [], []
@@ -166,10 +173,69 @@ def plot_descs(descs, side=25):
         pad = np.zeros(
             (n_tiles - len(descs),) + descs.shape[1:]).astype("uint8")
         descs = np.concatenate([descs, pad])
+    else:
+        descs = descs[:n_tiles]
 
     descs = descs.reshape((side, side, DSIZE, DSIZE)).transpose((0, 2, 1, 3))
     tiles = descs.reshape((side * DSIZE, side * DSIZE))
-    return cv2.resize(tiles, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST)
+    tiles = 255 * (tiles - tiles.min())/(tiles.max() - tiles.min())
+
+    return cv2.resize(tiles.astype(np.uint8), None, fx=4, fy=4,
+                      interpolation=cv2.INTER_NEAREST)
+
+
+#
+# Feature matching
+#
+
+FLANN_INDEX_KDTREE = 0   # FLANN strategy
+FLANN_INDEX_LSH = 6
+
+
+def flann_matching(des1, des2):
+    """Given 2 lists of descriptors, match them with FLANN."""
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matches = flann.knnMatch(des1, des2, k=2)
+
+    # Lowe's ratio test.
+    return [m for m, n in matches if m.distance < 0.7*n.distance]
+
+
+def sift_matching(img1, img2):
+    """Find SIFT correspondences between images in a list."""
+    sift = cv2.xfeatures2d.SIFT_create()
+
+    kp1, des1 = sift.detectAndCompute(img1, None)
+    kp2, des2 = sift.detectAndCompute(img2, None)
+
+    good = flann_matching(des1, des2)
+
+    draw_params = dict(matchColor=(0, 255, 0), singlePointColor=None, flags=2)
+    im_match = cv2.drawMatches(img1, kp1, img2, kp2, good, None, **draw_params)
+    cv2.imshow("Matches", im_match)
+
+
+def msop_matching(img1, img2):
+    """Find MSOP correspondences between images."""
+    (kp1, des1), (kp2, des2) = msop(img1), msop(img2)
+    kp1 = [cv2.KeyPoint(p[1], p[0], p[2]) for p in kp1]
+    kp2 = [cv2.KeyPoint(p[1], p[0], p[2]) for p in kp2]
+    des1, des2 = des1.reshape(-1, 64), des2.reshape(-1, 64)
+
+    good = flann_matching(des1, des2)
+
+    src_pts = np.array([kp1[m.queryIdx].pt for m in good]).reshape((-1, 1, 2))
+    dst_pts = np.array([kp2[m.trainIdx].pt for m in good]).reshape((-1, 1, 2))
+    _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    mask = mask.ravel().tolist()
+
+    draw_params = dict(matchColor=(0, 255, 0), singlePointColor=None, flags=2,
+                       matchesMask=mask)
+    im_match = cv2.drawMatches(img1, kp1, img2, kp2, good, None, **draw_params)
+    cv2.imshow("Matches", im_match)
 
 
 # MSOP from: https://github.com/momohuang/Panorama/blob/master/MSOP.cpp
@@ -177,11 +243,18 @@ def main():
     """Script entry point."""
     base_path = "../data/ppwwyyxx/CMU2"
 
-    img = cv2.imread(os.path.join(base_path, "medium00.JPG"))
-    points, descs = msop(img)
+    img1 = cv2.imread(os.path.join(base_path, "medium01.JPG"))
+    img2 = cv2.imread(os.path.join(base_path, "medium00.JPG"))
+    img1 = cv2.resize(img1, None, fx=0.5, fy=0.5)
+    img2 = cv2.resize(img2, None, fx=0.5, fy=0.5)
 
+    # sift_matching(img1, img2)
+    # msop_matching(img1, img2)
+
+    points, descs = msop(img1)
+    print(descs.shape)
     cv2.imshow('tiles', plot_descs(descs))
-    cv2.imshow('dst', plot_points(img.copy(), points))
+    cv2.imshow('dst', plot_points(img1.copy(), points))
     if cv2.waitKey(0) & 0xff == 27:
         cv2.destroyAllWindows()
 
