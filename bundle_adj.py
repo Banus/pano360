@@ -4,7 +4,7 @@ import os
 import numpy as np
 import cv2
 
-from blend import warp
+from blend import intrinsics, warp
 
 
 def _focal(v1, v2, d1, d2):
@@ -52,6 +52,31 @@ def rotation_to_mat(rot=np.random.randn(3)):
     return np.eye(3) + cross*np.sin(ang) + (1-np.cos(ang))*cross.dot(cross)
 
 
+def to_rotation(rot):
+    """Find the closest rotation in the Frobenious norm."""
+    uu_, _, vv_ = np.linalg.svd(rot)
+    rot = uu_.dot(vv_)
+    if np.linalg.det(rot) < 0:
+        rot *= -1   # no reflections
+    return rot
+
+
+def absolute_rotations(homs, kint):
+    """Find camera rotation w.r.t. a reference given homographies."""
+    rots = [to_rotation(np.linalg.inv(kint).dot(hom.dot(kint)))
+            for hom in homs]
+
+    # mid point as reference to reduce drift
+    mid = len(rots) // 2
+    rot_r = [rots[mid]]
+    for rot in rots[mid+1:]:
+        rot_r.append(rot.dot(rot_r[-1]))
+    rot_l = [np.eye(3)]
+    for rot in rots[:mid]:
+        rot_l.append(rot.T.dot(rot_l[-1]))
+    return rot_l[::-1] + rot_r
+
+
 def main():
     """Script entry point."""
     base_path = "../data/ppwwyyxx/CMU2"
@@ -69,21 +94,25 @@ def main():
     # intrinsics
     intr = np.array([[foc, 0, width/2], [0, foc, height/2], [0, 0, 1]])
 
-    proj1 = warp(imgs[0], intr, np.linalg.inv(homs[0]))[..., :3]
-    proj2 = warp(imgs[2], intr, homs[1])[..., :3]
+    height, width = imgs[0].shape[:2]
+    tr_ = np.array([[1, 0, width/2], [0, 1, height/2], [0, 0, 1]])
+
+    print(absolute_rotations(homs, intrinsics(foc)))
+    hom1 = tr_.dot(homs[0].dot(np.linalg.inv(tr_)))
+    hom2 = tr_.dot(homs[1].dot(np.linalg.inv(tr_)))
+
+    proj1 = warp(imgs[0], intr, np.linalg.inv(hom1))[..., :3]
+    proj2 = warp(imgs[2], intr, hom2)[..., :3]
     cv2.imshow('warp', np.uint8(proj1/3+proj2/3+imgs[1]/3))
 
-    # im1 = cv2.warpPerspective(imgs[0], homs[0],
+    # im1 = cv2.warpPerspective(imgs[0], hom1,
     #                           (imgs[1].shape[1], imgs[1].shape[0]))
-    # im2 = cv2.warpPerspective(imgs[2], np.linalg.inv(homs[1]),
+    # im2 = cv2.warpPerspective(imgs[2], np.linalg.inv(hom2),
     #                           (imgs[1].shape[1], imgs[1].shape[0]))
     # cv2.imshow('warp', np.uint8(im1/3+im2/3+imgs[1]/3))
 
     if cv2.waitKey(0) & 0xff == 27:
         cv2.destroyAllWindows()
-    # focals = [get_focal(hom) for hom in homs]
-    # print(focals)
-    # print(np.median([f for f in focals if f]))
 
 
 if __name__ == '__main__':

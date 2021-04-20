@@ -14,7 +14,41 @@ except ImportError:
 import cv2
 
 
-def intrinsics(focal, shape):
+class SphProj:
+    """Forward and backward spherical projection."""
+
+    @staticmethod
+    def hom2proj(pts):
+        """Project the points in spherical coordinates."""
+        hypot = np.sqrt(pts[:, 0]**2 + pts[:, 2]**2)
+        return np.stack([np.arctan2(pts[:, 0], pts[:, 2]),
+                        np.arctan2(pts[:, 1], hypot)], axis=-1)
+
+    @staticmethod
+    def proj2hom(pts):
+        """Recover projective points from spherical coordinates."""
+        return np.stack([np.sin(pts[:, 0]), np.tan(pts[:, 1]),
+                         np.cos(pts[:, 0])], axis=-1)
+
+
+class CylProj:
+    """Forward and backward cylidrical projection."""
+
+    @staticmethod
+    def hom2proj(pts):
+        """Project the points in cylindrical coordinates."""
+        hypot = np.sqrt(pts[:, 0]**2 + pts[:, 2]**2)
+        return np.stack([np.arctan2(pts[:, 0], pts[:, 2]),
+                        pts[:, 1]/hypot], axis=-1)
+
+    @staticmethod
+    def proj2hom(pts):
+        """Recover projective points from cylindrical coordinates."""
+        return np.stack([np.sin(pts[:, 0]), pts[:, 1], np.cos(pts[:, 0])],
+                        axis=-1)
+
+
+def intrinsics(focal, shape=(0, 0)):
     """Intrinsic matrix from focal."""
     height, width = shape
     if not isinstance(focal, (list, tuple)):
@@ -24,7 +58,7 @@ def intrinsics(focal, shape):
 
 
 # from: https://gist.github.com/royshil/0b21e8e7c6c1f46a16db66c384742b2b
-def warp(img, kint, hom=np.eye(3), mode="spherical"):
+def warp(img, kint, hom=np.eye(3), projector=SphProj.proj2hom):
     """Warp the image in cylindrical/spherical coordinates."""
     hh_, ww_ = img.shape[:2]
     y_i, x_i = np.indices((hh_, ww_))  # pixel coordinates
@@ -34,16 +68,7 @@ def warp(img, kint, hom=np.eye(3), mode="spherical"):
     xx_ = hom.dot(xx_.T).T
     xx_ = np.linalg.inv(kint).dot(xx_.T).T  # normalize coordinate
 
-    if mode == "spherical":
-        # calculate equirectangular coords (sin(theta), sin(phi), cos(theta))
-        x_n = np.stack([np.sin(xx_[:, 0]), np.tan(xx_[:, 1]),
-                        np.cos(xx_[:, 0])], axis=-1)
-    elif mode == "cylindrical":
-        # calculate cylindrical coords (sin(theta), h, cos(theta))
-        x_n = np.stack([np.sin(xx_[:, 0]), xx_[:, 1], np.cos(xx_[:, 0])],
-                       axis=-1)
-    else:  # linear projection
-        x_n = xx_
+    x_n = projector(xx_)
 
     # project back to image-pixels and pixel coordinates
     x_pr = kint.dot(x_n.reshape(-1, 3).T).T
