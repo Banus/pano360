@@ -204,18 +204,44 @@ def flann_matching(des1, des2):
     return [m for m, n in matches if m.distance < 0.7*n.distance]
 
 
-def sift_matching(img1, img2):
+def _match_hom(pt1, pt2, des1, des2):
+    """Match points, estimate homography and return inlier matches."""
+    good = flann_matching(des1, des2)
+    match = np.int32([(m.queryIdx, m.trainIdx) for m in good])
+
+    query_pts = np.float32([pt1[m] for m, _ in match])
+    train_pts = np.float32([pt2[m] for _, m in match])
+    hom, mask = cv2.findHomography(query_pts, train_pts)
+
+    return match[mask], hom
+
+
+def sift_matching(imgs):
     """Find SIFT correspondences between images in a list."""
     sift = cv2.xfeatures2d.SIFT_create()
 
-    kp1, des1 = sift.detectAndCompute(img1, None)
-    kp2, des2 = sift.detectAndCompute(img2, None)
+    kpts, matches, homs, descs = [], [], [], []
+    for img in imgs:
+        kp_, des = sift.detectAndCompute(img, None)
+        des = np.sqrt(des/(des.sum(axis=1, keepdims=True) + 1e-7))  # RootSIFT
+        cent = np.array([img.shape[1], img.shape[0]])
+        kpts.append(np.float32([kp.pt - cent for kp in kp_]))
 
-    good = flann_matching(des1, des2)
+        if descs:
+            match, hom = _match_hom(kpts[-2], kpts[-1], descs[-1], des)
+            matches.append(match)
+            homs.append(hom)
+        descs.append(des)
 
-    draw_params = dict(matchColor=(0, 255, 0), singlePointColor=None, flags=2)
-    im_match = cv2.drawMatches(img1, kp1, img2, kp2, good, None, **draw_params)
-    cv2.imshow("Matches", im_match)
+    # close the loop
+    match, hom = _match_hom(kpts[-1], kpts[0], descs[-1], descs[0])
+    matches.append(match)
+    homs.append(hom)
+
+    kpts = np.array(kpts, dtype=np.object)
+    matches = np.array(matches, dtype=np.object)
+    np.savez("matches2.npz", kpts=kpts, matches=matches, homs=homs)
+    # im_out = cv2.warpPerspective(img1, hom, (img2.shape[1], img2.shape[0]))
 
 
 def msop_matching(img1, img2):
@@ -243,20 +269,18 @@ def main():
     """Script entry point."""
     base_path = "../data/ppwwyyxx/CMU2"
 
-    img1 = cv2.imread(os.path.join(base_path, "medium01.JPG"))
-    img2 = cv2.imread(os.path.join(base_path, "medium00.JPG"))
-    img1 = cv2.resize(img1, None, fx=0.5, fy=0.5)
-    img2 = cv2.resize(img2, None, fx=0.5, fy=0.5)
+    imgs = [cv2.imread(os.path.join(base_path, f"medium{i:02d}.JPG"))
+            for i in range(13)]
+    imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
 
-    # sift_matching(img1, img2)
-    # msop_matching(img1, img2)
+    sift_matching(imgs)
 
-    points, descs = msop(img1)
-    print(descs.shape)
-    cv2.imshow('tiles', plot_descs(descs))
-    cv2.imshow('dst', plot_points(img1.copy(), points))
-    if cv2.waitKey(0) & 0xff == 27:
-        cv2.destroyAllWindows()
+    # points, descs = msop(img1)
+
+    # cv2.imshow('tiles', plot_descs(descs))
+    # cv2.imshow('dst', plot_points(img1.copy(), points))
+    # if cv2.waitKey(0) & 0xff == 27:
+    #     cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':

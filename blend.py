@@ -14,24 +14,36 @@ except ImportError:
 import cv2
 
 
+def intrinsics(focal, shape):
+    """Intrinsic matrix from focal."""
+    height, width = shape
+    if not isinstance(focal, (list, tuple)):
+        focal = (focal,)*2
+    return np.array(
+        [[focal[0], 0, width/2], [0, focal[0], height/2], [0, 0, 1]])
+
+
 # from: https://gist.github.com/royshil/0b21e8e7c6c1f46a16db66c384742b2b
-def warp(img, kint, spherical=True):
+def warp(img, kint, hom=np.eye(3), mode="spherical"):
     """Warp the image in cylindrical/spherical coordinates."""
     hh_, ww_ = img.shape[:2]
     y_i, x_i = np.indices((hh_, ww_))  # pixel coordinates
 
     # homogeneous coordinates
     xx_ = np.stack([x_i, y_i, np.ones_like(x_i)], axis=-1).reshape(-1, 3)
+    xx_ = hom.dot(xx_.T).T
     xx_ = np.linalg.inv(kint).dot(xx_.T).T  # normalize coordinate
 
-    if spherical:
+    if mode == "spherical":
         # calculate equirectangular coords (sin(theta), sin(phi), cos(theta))
-        x_n = np.stack([np.sin(xx_[:, 0]), np.sin(xx_[:, 1]),
-                        np.cos(xx_[:, 0])*np.cos(xx_[:, 1])], axis=-1)
-    else:
+        x_n = np.stack([np.sin(xx_[:, 0]), np.tan(xx_[:, 1]),
+                        np.cos(xx_[:, 0])], axis=-1)
+    elif mode == "cylindrical":
         # calculate cylindrical coords (sin(theta), h, cos(theta))
         x_n = np.stack([np.sin(xx_[:, 0]), xx_[:, 1], np.cos(xx_[:, 0])],
                        axis=-1)
+    else:  # linear projection
+        x_n = xx_
 
     # project back to image-pixels and pixel coordinates
     x_pr = kint.dot(x_n.reshape(-1, 3).T).T
@@ -212,11 +224,10 @@ def main():
     img1 = cv2.imread(os.path.join(base_path, "medium01.JPG"))
     img2 = cv2.imread(os.path.join(base_path, "medium00.JPG"))
 
-    height, width = img1.shape[:2]
     foc, delta = 3e3, 976
 
     # intrinsics
-    intr = np.array([[foc, 0, width/2], [0, foc, height/2], [0, 0, 1]])
+    intr = intrinsics(foc, img1.shape[:2])
     img1, img2 = warp(img1, intr), warp(img2, intr)
 
     mask = graph_cut(img1[:, -delta:], img2[:, :delta])
