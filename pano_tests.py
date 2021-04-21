@@ -4,7 +4,7 @@ import numpy as np
 import numpy.testing as npt
 
 import blend as bl
-from bundle_adj import get_focal, rotation_to_mat, mat_to_angle
+import bundle_adj as ba
 
 
 class TestHomography(unittest.TestCase):
@@ -14,17 +14,23 @@ class TestHomography(unittest.TestCase):
     def test_is_rotation():
         """Test if matrix from exp conversion is a valid rotation."""
         rad = np.random.randn(3)
-        rot = rotation_to_mat(rad)
+        rot = ba.rotation_to_mat(rad)
         npt.assert_almost_equal(rot.T.dot(rot), np.eye(3))
-        npt.assert_almost_equal(mat_to_angle(rot), rad)
+        npt.assert_almost_equal(ba.mat_to_angle(rot), rad)
 
     def test_focal(self):
         """Test extraction of focal from rotation + projection matrix."""
         kint = bl.intrinsics(1e3)
-        hom = kint.dot(rotation_to_mat().dot(np.linalg.inv(kint)))
+        hom = kint.dot(ba.rotation_to_mat().dot(np.linalg.inv(kint)))
 
-        self.assertAlmostEqual(get_focal(hom), 1e3)
-        self.assertAlmostEqual(get_focal(np.linalg.inv(hom)), 1e3)
+        self.assertAlmostEqual(ba.get_focal(hom), 1e3)
+        self.assertAlmostEqual(ba.get_focal(np.linalg.inv(hom)), 1e3)
+
+    @staticmethod
+    def test_camera_inverse():
+        """Test if camera transform and its inverse are correct."""
+        cam = ba.Image(None, ba.rotation_to_mat(), bl.intrinsics(1e3))
+        npt.assert_almost_equal(cam.hom().dot(cam.inv_hom()), np.eye(3))
 
 
 class TestWarp(unittest.TestCase):

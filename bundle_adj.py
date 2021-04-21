@@ -5,10 +5,10 @@ from dataclasses import dataclass
 import numpy as np
 import cv2
 
-from blend import intrinsics, warp, SphProj
+from blend import intrinsics, SphProj
 
 
-MAX_RESOLUTION = 8000
+MAX_RESOLUTION = 1400
 
 # bundle adjustment parameters
 PARAMS_PER_CAMERA = 6
@@ -20,9 +20,17 @@ class Image:
     """Patch with all the informations for stitching."""
 
     img: np.ndarray
-    range: tuple
     rot: np.ndarray
     intr: np.ndarray
+    range: tuple = (np.zeros(2), np.zeros(2))
+
+    def hom(self):
+        """Homography to normalized coordinates."""
+        return self.rot.dot(np.linalg.inv(self.intr))
+
+    def inv_hom(self):
+        """Return inverse camera transform."""
+        return self.intr.dot(self.rot.T)
 
 
 def _focal(v1, v2, d1, d2):
@@ -137,7 +145,7 @@ def dr_dvi(rot):
 # Reprojection
 #
 
-def proj_img_range(rot, shape, kint):
+def _proj_img_range_border(rot, shape, kint):
     """Estimate the extent of the image after projection."""
     nel = 100
     height, width = shape
@@ -155,6 +163,23 @@ def proj_img_range(rot, shape, kint):
     return np.min(pts, axis=0), np.max(pts, axis=0)   # range
 
 
+def _proj_img_range_corners(shape, hom):
+    """Estimate image extent from corners with check for angle wraparound."""
+    height, width = shape
+    pts = np.array([[-width/2, -height/2, 1], [width/2, -height/2, 1],
+                    [-width/2, height/2, 1], [width/2, height/2, 1]])
+    pts = SphProj.hom2proj(hom.dot(pts.T).T)
+
+    xmin, xmax = min(pts[0, 0], pts[2, 0]), max(pts[1, 0], pts[3, 0])
+    ymin, ymax = min(pts[0, 1], pts[1, 1]), max(pts[2, 1], pts[3, 1])
+    if xmin > xmax:  # push to right
+        xmax += 2 * np.pi
+    if ymin > ymax:  # push on top
+        ymax += np.pi
+
+    return np.array([xmin, ymin]), np.array([xmax, ymax])
+
+
 def estimate_resolution(regions):
     """Estimate the resolution of the final image."""
     min_r, max_r = zip(*[reg.range for reg in regions])
@@ -162,12 +187,8 @@ def estimate_resolution(regions):
     size = max_r - min_r
 
     mid = regions[len(regions) // 2]   # central image
-    height, width = mid.img.shape[:2]
-    corners = np.array([[width/2, height/2, 1], [-width/2, -height/2, 1]])
-
-    pts = SphProj.hom2proj(
-        mid.rot.dot(np.linalg.inv(mid.intr).dot(corners.T)).T)
-    resolution = (pts[0] - pts[1]) / np.array([width, height])
+    im_shape = np.array(mid.img.shape[:2][::-1])
+    resolution = (mid.range[1] - mid.range[0]) / im_shape
 
     max_side = np.max(size / resolution)
     if max_side > MAX_RESOLUTION:
@@ -178,14 +199,43 @@ def estimate_resolution(regions):
 
 def stitch(imgs, rots, kints):
     """Stitch the images together."""
-    regions = [Image(im, proj_img_range(rot, im.shape[:2], k), rot, k)
-               for im, rot, k in zip(imgs, rots, kints)]
+    regions = [Image(im, rot, k) for im, rot, k in zip(imgs, rots, kints)]
+    for i, reg in enumerate(regions):
+        reg.range = _proj_img_range_corners(imgs[i].shape[:2], reg.hom())
+
     resolution, im_range = estimate_resolution(regions)
     target = (im_range[1] - im_range[0]) / resolution
 
-    print(resolution, target)
+    shape = tuple(int(t) for t in np.round(target))[::-1]  # y,x order
+    mosaic = np.zeros(shape + (3,), dtype=np.uint8)        # RGBA image
     for reg in regions:
-        print(reg.range)
+        bottom = np.round((reg.range[0] - im_range[0])/resolution)
+        top = np.round((reg.range[1] - im_range[0])/resolution)
+        bottom, top = bottom.astype(np.int32), top.astype(np.int32)
+        hh_, ww_ = reg.img.shape[:2]  # original image shape
+
+        # find pixel coordinates
+        y_i, x_i = np.indices((top[1]-bottom[1], top[0]-bottom[0]))
+        x_i = (x_i + bottom[0]) * resolution[0] + im_range[0][0]
+        y_i = (y_i + bottom[1]) * resolution[1] + im_range[0][1]
+        xx_ = SphProj.proj2hom(np.stack([x_i, y_i], axis=-1).reshape(-1, 2))
+
+        # transform to the original image coordinates
+        xx_ = reg.inv_hom().dot(xx_.T).T.astype(np.float32)
+        x_pr = xx_[:, :-1] / xx_[:, [-1]] + np.float32([ww_/2, hh_/2])
+        x_pr = x_pr.reshape(top[1]-bottom[1], top[0]-bottom[0], -1)
+        mask = (x_pr[..., 0] < 0) | (x_pr[..., 0] >= ww_) | \
+               (x_pr[..., 1] < 0) | (x_pr[..., 1] >= hh_)
+        x_pr[mask] = -1
+
+        # paste only valid pixels
+        warped = cv2.remap(reg.img, x_pr[:, :, 0], x_pr[:, :, 1],
+                           cv2.INTER_AREA, borderMode=cv2.BORDER_CONSTANT)
+        tile = mosaic[bottom[1]:top[1], bottom[0]:top[0]]
+        mosaic[bottom[1]:top[1], bottom[0]:top[0]] = np.where(
+            mask[..., None], tile, warped)
+
+    return mosaic
 
 
 def main():
@@ -193,7 +243,7 @@ def main():
     base_path = "../data/ppwwyyxx/CMU2"
 
     imgs = [cv2.imread(os.path.join(base_path, f"medium{i:02d}.JPG"))
-            for i in range(3)]
+            for i in range(13)]
     imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
 
     arr = np.load("matches2.npz", allow_pickle=True)
@@ -201,22 +251,14 @@ def main():
 
     focals = [get_focal(np.linalg.inv(hom)) for hom in homs]
     foc = np.median([f for f in focals])
-    height, width = imgs[1].shape[:2]
-    # intrinsics
-    intr = np.array([[foc, 0, width/2], [0, foc, height/2], [0, 0, 1]])
-
-    height, width = imgs[0].shape[:2]
-    tr_ = np.array([[1, 0, width/2], [0, 1, height/2], [0, 0, 1]])
 
     rots = absolute_rotations(homs, intrinsics(foc))
-    stitch(imgs, rots, [intrinsics(foc)]*len(imgs))
+    mosaic = stitch(imgs, rots, [intrinsics(foc)]*len(imgs))
+    cv2.imshow("Mosaic", mosaic)
 
-    hom1 = tr_.dot(homs[0].dot(np.linalg.inv(tr_)))
-    hom2 = tr_.dot(homs[1].dot(np.linalg.inv(tr_)))
-
-    proj1 = warp(imgs[0], intr, np.linalg.inv(hom1))[..., :3]
-    proj2 = warp(imgs[2], intr, hom2)[..., :3]
-    cv2.imshow('warp', np.uint8(proj1/3+proj2/3+imgs[1]/3))
+    # proj1 = warp(imgs[0], intr, np.linalg.inv(hom1))[..., :3]
+    # proj2 = warp(imgs[2], intr, hom2)[..., :3]
+    # cv2.imshow('warp', np.uint8(proj1/3+proj2/3+imgs[1]/3))
 
     # im1 = cv2.warpPerspective(imgs[0], hom1,
     #                           (imgs[1].shape[1], imgs[1].shape[0]))
