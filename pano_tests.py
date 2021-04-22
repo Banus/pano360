@@ -32,6 +32,18 @@ class TestHomography(unittest.TestCase):
         cam = ba.Image(None, ba.rotation_to_mat(), bl.intrinsics(1e3))
         npt.assert_almost_equal(cam.hom().dot(cam.inv_hom()), np.eye(3))
 
+    @staticmethod
+    def test_straighten():
+        """Test if straightening correctly recovers the vertical."""
+        n_cams = 10
+        step = np.array([0, 1, 0]) * 2 * np.pi / n_cams
+        rots = [ba.rotation_to_mat(step * i) for i in range(n_cams)]
+
+        tilt = ba.rotation_to_mat(np.array([0.1, 0, 0]))
+        new_rots = [rot.dot(tilt) for rot in rots]   # change the vertical
+        new_rots = np.stack(ba.straighten(new_rots), axis=0)
+        npt.assert_almost_equal(new_rots, np.stack(rots, axis=0))
+
 
 class TestWarp(unittest.TestCase):
     """Test warping functions."""

@@ -200,7 +200,7 @@ def flann_matching(des1, des2):
     flann = cv2.FlannBasedMatcher(index_params, search_params)
     matches = flann.knnMatch(des1, des2, k=2)
 
-    # Lowe's ratio test.
+    # Lowe's ratio test
     return [m for m, n in matches if m.distance < 0.7*n.distance]
 
 
@@ -211,7 +211,7 @@ def _match_hom(pt1, pt2, des1, des2):
 
     query_pts = np.float32([pt1[m] for m, _ in match])
     train_pts = np.float32([pt2[m] for _, m in match])
-    hom, mask = cv2.findHomography(query_pts, train_pts)
+    hom, mask = cv2.findHomography(query_pts, train_pts, cv2.RANSAC)
 
     return match[mask], hom
 
@@ -221,7 +221,9 @@ def sift_matching(imgs):
     sift = cv2.xfeatures2d.SIFT_create()
 
     kpts, matches, homs, descs = [], [], [], []
-    for img in imgs:
+    for i, img in enumerate(imgs):
+        print(f"Processing image #{i+1}")
+
         kp_, des = sift.detectAndCompute(img, None)
         des = np.sqrt(des/(des.sum(axis=1, keepdims=True) + 1e-7))  # RootSIFT
         cent = np.array([img.shape[1], img.shape[0]])

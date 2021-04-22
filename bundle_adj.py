@@ -12,7 +12,7 @@ MAX_RESOLUTION = 1400
 
 # bundle adjustment parameters
 PARAMS_PER_CAMERA = 6
-PARAMS_PER_MATCH = 2
+TERMS_PER_MATCH = 2
 
 
 @dataclass
@@ -33,6 +33,11 @@ class Image:
         return self.intr.dot(self.rot.T)
 
 
+def _hom(cm1, cm2):
+    """Homography between two cameras."""
+    return (cm1.intr.dot(cm1.rot)).dot(cm2.rot.T.dot(np.linalg.inv(cm2.intr)))
+
+
 def _focal(v1, v2, d1, d2):
     """Get focal from two squared estimates."""
     if v1 < v2:
@@ -44,15 +49,8 @@ def _focal(v1, v2, d1, d2):
     return 0
 
 
-def get_focal(hom):
-    """Estimate the focal lenght from the homography [1].
-
-    References
-    ----------
-    [1] Szeliski, Richard, and Heung-Yeung Shum. "Creating full view panoramic
-    image mosaics and environment maps." Proceedings of the 24th annual
-    conference on Computer graphics and interactive techniques. 1997.
-    """
+def _get_focal(hom):
+    """Run on the homography and its inverse to get a valid estimate."""
     hom = hom.ravel()
 
     d1, d2 = hom[6]*hom[7], (hom[7] - hom[6])*(hom[7] + hom[6])
@@ -66,6 +64,19 @@ def get_focal(hom):
     f0 = _focal(v1, v2, d1, d2)
 
     return np.sqrt(f0*f1)
+
+
+def get_focal(hom):
+    """Estimate the focal lenght from the homography [1].
+
+    References
+    ----------
+    [1] Szeliski, Richard, and Heung-Yeung Shum. "Creating full view panoramic
+    image mosaics and environment maps." Proceedings of the 24th annual
+    conference on Computer graphics and interactive techniques. 1997.
+    """
+    f_ = _get_focal(hom)
+    return f_ if f_ else _get_focal(np.linalg.inv(hom))
 
 
 def _cross_mat(vec):
@@ -105,10 +116,10 @@ def to_rotation(rot):
     return rot
 
 
-def absolute_rotations(homs, kint):
+def absolute_rotations(homs, kints):
     """Find camera rotation w.r.t. a reference given homographies."""
     rots = [to_rotation(np.linalg.inv(kint).dot(hom.dot(kint)))
-            for hom in homs]
+            for hom, kint in zip(homs, kints)]
 
     # mid point as reference to reduce drift
     mid = len(rots) // 2
@@ -121,9 +132,41 @@ def absolute_rotations(homs, kint):
     return rot_l[::-1] + rot_r
 
 
+def straighten(rots):
+    """Global rotation to have the x axis on the same plane."""
+    cov = np.cov(np.stack([rot[0] for rot in rots], axis=-1))
+    _, _, vv_ = np.linalg.svd(cov)
+    v_y = vv_[2]
+    v_z = np.sum(np.stack([rot[2] for rot in rots], axis=0), axis=0)
+    v_x = np.cross(v_y, v_z)
+    v_x /= np.linalg.norm(v_x)
+    v_z = np.cross(v_x, v_y)
+
+    rot_g = np.stack([v_x, v_y, v_z], axis=-1)
+    return [rot.dot(rot_g) for rot in rots]
+
+
 #
 # Bundle adjustment
 #
+
+def initial_estimate(imgs, homs):
+    """Find an initial estimate for estrinsics and intrinsics."""
+    focals = [get_focal(hom) for hom in homs]
+    homs = [np.linalg.inv(hom) for hom in homs]
+    foc = np.median([f for f in focals])
+
+    kints = [intrinsics(foc)] * len(imgs)
+    rots = absolute_rotations(homs, kints)
+    rots = straighten(rots)
+
+    return [Image(im, rot, k) for im, rot, k in zip(imgs, rots, kints)]
+
+
+def residuals():
+    """Find estimation errors."""
+    pass
+
 
 def dr_dvi(rot):
     """Rotation derivative w.r.t. the exponential representation."""
@@ -134,11 +177,32 @@ def dr_dvi(rot):
 
     ire = np.eye(3) - rot
     res = np.stack([_cross_mat(rad)*r for r in rad])
-    res[0] += _cross_mat(rad.cross(ire[:, 0]))
-    res[1] += _cross_mat(rad.cross(ire[:, 1]))
-    res[2] += _cross_mat(rad.cross(ire[:, 2]))
+    res[0] += _cross_mat(np.cross(rad, ire[:, 0]))
+    res[1] += _cross_mat(np.cross(rad, ire[:, 1]))
+    res[2] += _cross_mat(np.cross(rad, ire[:, 2]))
 
     return res.dot(rot) / vsqr
+
+
+def bundle_adjustment(regions, kpts, matches):
+    """Refine the camera parameters."""
+    m_offs = np.cumsum([0] + [len(m) for m in matches])
+    n_match, m_offs = m_offs[-1], m_offs[:-1]
+    # hack: create match dict for now
+    mdict = {(i, i+1): m for i, m in enumerate(matches[:-1])}
+    mdict[(len(matches)-1, 0)] = matches[-1]
+
+    np_cam = PARAMS_PER_CAMERA * len(regions)
+    print(n_match, np_cam)
+
+    # jac = np.zeros((TERMS_PER_MATCH * n_match, np_cam), dtype="float32")
+    # jac_t_jac = np.zeros((np_cam, np_cam)*2, dtype="float32")
+
+    # drs = [dr_dvi(r.rot) for r in regions]  # cache rot derivatives
+    # for idx, ((i, j), match) in enumerate(mdict.items()):
+    #     pass
+
+    return regions
 
 
 #
@@ -197,11 +261,10 @@ def estimate_resolution(regions):
     return resolution, (min_r, max_r)
 
 
-def stitch(imgs, rots, kints):
+def stitch(regions):
     """Stitch the images together."""
-    regions = [Image(im, rot, k) for im, rot, k in zip(imgs, rots, kints)]
-    for i, reg in enumerate(regions):
-        reg.range = _proj_img_range_corners(imgs[i].shape[:2], reg.hom())
+    for reg in regions:
+        reg.range = _proj_img_range_corners(reg.img.shape[:2], reg.hom())
 
     resolution, im_range = estimate_resolution(regions)
     target = (im_range[1] - im_range[0]) / resolution
@@ -247,24 +310,13 @@ def main():
     imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
 
     arr = np.load("matches2.npz", allow_pickle=True)
-    _, _, homs = arr['kpts'], arr['matches'], arr['homs']
+    kpts, matches, homs = arr['kpts'], arr['matches'], arr['homs']
 
-    focals = [get_focal(np.linalg.inv(hom)) for hom in homs]
-    foc = np.median([f for f in focals])
+    regions = initial_estimate(imgs, homs)
+    regions = bundle_adjustment(regions, kpts, matches)
 
-    rots = absolute_rotations(homs, intrinsics(foc))
-    mosaic = stitch(imgs, rots, [intrinsics(foc)]*len(imgs))
+    mosaic = stitch(regions)
     cv2.imshow("Mosaic", mosaic)
-
-    # proj1 = warp(imgs[0], intr, np.linalg.inv(hom1))[..., :3]
-    # proj2 = warp(imgs[2], intr, hom2)[..., :3]
-    # cv2.imshow('warp', np.uint8(proj1/3+proj2/3+imgs[1]/3))
-
-    # im1 = cv2.warpPerspective(imgs[0], hom1,
-    #                           (imgs[1].shape[1], imgs[1].shape[0]))
-    # im2 = cv2.warpPerspective(imgs[2], np.linalg.inv(hom2),
-    #                           (imgs[1].shape[1], imgs[1].shape[0]))
-    # cv2.imshow('warp', np.uint8(im1/3+im2/3+imgs[1]/3))
 
     if cv2.waitKey(0) & 0xff == 27:
         cv2.destroyAllWindows()
