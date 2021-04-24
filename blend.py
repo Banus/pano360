@@ -48,13 +48,12 @@ class CylProj:
                         axis=-1)
 
 
-def intrinsics(focal, shape=(0, 0)):
+def intrinsics(focal, center=(0, 0)):
     """Intrinsic matrix from focal."""
-    height, width = shape
     if not isinstance(focal, (list, tuple)):
         focal = (focal,)*2
     return np.array(
-        [[focal[0], 0, width/2], [0, focal[0], height/2], [0, 0, 1]])
+        [[focal[0], 0, center[0]], [0, focal[0], center[1]], [0, 0, 1]])
 
 
 # from: https://gist.github.com/royshil/0b21e8e7c6c1f46a16db66c384742b2b
@@ -252,7 +251,8 @@ def main():
     foc, delta = 3e3, 976
 
     # intrinsics
-    intr = intrinsics(foc, img1.shape[:2])
+    height, width = img1.shape[:2]
+    intr = intrinsics(foc, [width/2, height/2])
     img1, img2 = warp(img1, intr), warp(img2, intr)
 
     mask = graph_cut(img1[:, -delta:], img2[:, :delta])

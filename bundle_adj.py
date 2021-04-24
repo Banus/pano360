@@ -16,7 +16,9 @@ MAX_RESOLUTION = 1400
 # bundle adjustment parameters
 PARAMS_PER_CAMERA = 6
 TERMS_PER_MATCH = 2
-LM_LAMBDA = 5    # Levenberg–Marquardt regularization
+# Levenberg–Marquardt parameters
+LM_LAMBDA = 5         # regularization strenght
+LM_MAX_ITER = 10      # maximum number of iterations
 
 
 @dataclass
@@ -104,7 +106,7 @@ def mat_to_angle(rot):
     mod = np.linalg.norm(rad)
 
     if mod < 1e-7:
-        rad = 0
+        rad = np.zeros(3)
     else:
         theta = np.arccos(np.clip((np.trace(rot)-1) / 2, -1, 1))
         rad *= (theta / mod)
@@ -118,20 +120,6 @@ def to_rotation(rot):
     if np.linalg.det(rot) < 0:
         rot *= -1   # no reflections
     return rot
-
-
-def straighten(rots):
-    """Global rotation to have the x axis on the same plane."""
-    cov = np.cov(np.stack([rot[0] for rot in rots], axis=-1))
-    _, _, vv_ = np.linalg.svd(cov)
-    v_y = vv_[2]
-    v_z = np.sum(np.stack([rot[2] for rot in rots], axis=0), axis=0)
-    v_x = np.cross(v_y, v_z)
-    v_x /= np.linalg.norm(v_x)
-    v_z = np.cross(v_x, v_y)
-
-    rot_g = np.stack([v_x, v_y, v_z], axis=-1)
-    return [rot.dot(rot_g) for rot in rots]
 
 
 def idx_to_keypoints(matches, kpts):
@@ -156,39 +144,18 @@ def idx_to_keypoints(matches, kpts):
 # Bundle adjustment
 #
 
-def traverse(imgs, matches):
-    """Traverse connected matches by visiting the best matches first."""
-    # find starting point
-    idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
-                              for j in matches[i].keys()])
-    src = idx[np.argmax(scores)]
-    intr = intrinsics(np.median([get_focal(hom) for hom in homs]))
+def params_to_camera(params):
+    """Convert the camera parameters to rotation / calibration matrix."""
+    foc, x_c, y_c = params[:3]
+    return Image(None, rotation_to_mat(params[3:]),
+                 intrinsics(foc, (x_c, y_c)))
 
-    iba = IncrementalBundleAdjuster(len(imgs))
-    iba.cameras[src] = Image(imgs[src], np.eye(3), intr)
 
-    qq_ = [(-matches[src][j][2], src, j) for j in matches[src].keys()]
-    heapq.heapify(qq_)
-
-    while True:
-        try:
-            score, src, dst = heapq.heappop(qq_)
-        except IndexError:
-            break
-        if iba.cameras[dst] is not None:  # already estimated
-            continue
-
-        hom = matches[dst][src][1]
-        rot = to_rotation(np.linalg.inv(intr).dot(hom.dot(intr)))
-        rot = iba.cameras[src].rot.dot(rot)
-
-        iba.cameras[dst] = Image(imgs[dst], rot, intr)
-        iba.add(src, dst, matches[dst][src][0])
-
-        for new in matches[dst].keys():
-            heapq.heappush(qq_, (-matches[dst][new][2], dst, new))
-
-    return iba.cameras
+def camera_to_params(camera):
+    """Extract the parameter vector from the camera."""
+    intr = camera.intr
+    params = np.array([intr[0, 0], intr[0, 2], intr[1, 2]])
+    return np.concatenate([params, mat_to_angle(camera.rot)])
 
 
 def residuals(cameras, matches):
@@ -265,27 +232,27 @@ def _jacobian_symbolic(cameras, matches):
             match[:, 3:6].T)
 
         c_off_i = cam_idx.index(i)*PARAMS_PER_CAMERA
-        jac[m_slice, c_off_i] = drdv(_DKDFOCAL.dot(u2_))
-        jac[m_slice, c_off_i + 1] = drdv(_DKDPPX.dot(u2_))
-        jac[m_slice, c_off_i + 2] = drdv(_DKDPPY.dot(u2_))
+        jac[m_slice, c_off_i] = -drdv(_DKDFOCAL.dot(u2_))
+        jac[m_slice, c_off_i + 1] = -drdv(_DKDPPX.dot(u2_))
+        jac[m_slice, c_off_i + 2] = -drdv(_DKDPPY.dot(u2_))
         # rotation
         drdvi = drs[cam_idx.index(i)]
-        jac[m_slice, c_off_i + 3] = drdv(from_K.dot(drdvi[0].dot(u2_)))
-        jac[m_slice, c_off_i + 4] = drdv(from_K.dot(drdvi[1].dot(u2_)))
-        jac[m_slice, c_off_i + 5] = drdv(from_K.dot(drdvi[2].dot(u2_)))
+        jac[m_slice, c_off_i + 3] = drdv(from_K.dot(drdvi[0].T.dot(u2_)))
+        jac[m_slice, c_off_i + 4] = drdv(from_K.dot(drdvi[1].T.dot(u2_)))
+        jac[m_slice, c_off_i + 5] = drdv(from_K.dot(drdvi[2].T.dot(u2_)))
 
         # # second camera
         u2_ = -np.linalg.inv(to_K).dot(match[:, 3:6].T)
 
         c_off_j = cam_idx.index(j)*PARAMS_PER_CAMERA
-        jac[m_slice, c_off_j] = drdv(hom.dot(_DKDFOCAL).dot(u2_))
-        jac[m_slice, c_off_j + 1] = drdv(hom.dot(_DKDPPX).dot(u2_))
-        jac[m_slice, c_off_j + 2] = drdv(hom.dot(_DKDPPY).dot(u2_))
+        jac[m_slice, c_off_j] = -drdv(hom.dot(_DKDFOCAL).dot(u2_))
+        jac[m_slice, c_off_j + 1] = -drdv(hom.dot(_DKDPPX).dot(u2_))
+        jac[m_slice, c_off_j + 2] = -drdv(hom.dot(_DKDPPY).dot(u2_))
         # rotation
-        drdvi_t = drs[cam_idx.index(j)].transpose(0, 2, 1)
-        jac[m_slice, c_off_j + 3] = drdv(hom.dot(drdvi_t[0].dot(u2_)))
-        jac[m_slice, c_off_j + 4] = drdv(hom.dot(drdvi_t[1].dot(u2_)))
-        jac[m_slice, c_off_j + 5] = drdv(hom.dot(drdvi_t[2].dot(u2_)))
+        drdvi, hom = drs[cam_idx.index(j)], from_K.dot(from_R)
+        jac[m_slice, c_off_j + 3] = drdv(hom.dot(drdvi[0].T.dot(u2_)))
+        jac[m_slice, c_off_j + 4] = drdv(hom.dot(drdvi[1].T.dot(u2_)))
+        jac[m_slice, c_off_j + 5] = drdv(hom.dot(drdvi[2].T.dot(u2_)))
 
         # J^T J
         i_slice = slice(c_off_i, c_off_i+PARAMS_PER_CAMERA)
@@ -303,6 +270,33 @@ def _jacobian_symbolic(cameras, matches):
     return jac, jac_t_jac
 
 
+def _jacobian_numeric(cameras, matches):
+    """Approximate the Jacobian with symmetric differences; for debug."""
+    step = 1e-6
+    idx = [i for i, c in enumerate(cameras) if c]
+
+    def _dcam(params, i, j, delta):
+        """Perturb an element of the camera parameters."""
+        newp = params.copy()
+        newp[i, j] += delta
+
+        cams = [None] * len(cameras)
+        for ind, param in zip(idx, newp):
+            cams[ind] = params_to_camera(param)
+        return cams
+
+    params = np.stack([camera_to_params(c) for c in cameras if c is not None])
+    jacs = []
+    for i, cam in enumerate(params):
+        for j, _ in enumerate(cam):
+            res_plus = residuals(_dcam(params, i, j, step), matches)
+            res_minus = residuals(_dcam(params, i, j, -step), matches)
+            jacs.append((res_plus - res_minus) / (2*step))
+
+    jac = np.stack(jacs, axis=1)
+    return jac, jac.T.dot(jac)
+
+
 class IncrementalBundleAdjuster:
     """Bundle adjustment one image at a time."""
 
@@ -316,15 +310,111 @@ class IncrementalBundleAdjuster:
         """Add a new image to the bundler."""
         self.matches.append((src, dst, match))
 
-        if self.is_incremental and len(self.matches) <= 1:
+        if self.is_incremental:
             self.optimize()
 
     def optimize(self):
         """Refine the camera parameters."""
+        idx = [i for i, c in enumerate(self.cameras) if c is not None]
         errs = residuals(self.cameras, self.matches)
-        logging.debug(f"Initial error: {loss(errs)}")
+        best_err = loss(errs)
+        logging.debug(f"Initial error: {best_err}")
 
-        jac, jac_t_jac = _jacobian_symbolic(self.cameras, self.matches)
+        n_not_improved = 0   # exit loop if the loss doesn't improve
+        for it_ in range(LM_MAX_ITER):
+            # Levenberg–Marquardt iteration
+            jac, jac_t_jac = _jacobian_symbolic(self.cameras, self.matches)
+
+            # jac2, jac_t_jac2 = _jacobian_numeric(self.cameras, self.matches)
+            # mod = 2*np.abs(jac2)
+            # mod[mod < 1e-6] = 1
+            # diff = np.abs(jac-jac2)/mod
+            # print(np.max(diff))
+            # jacc = cv2.resize(diff.T, None, fx=0.5, fy=20,
+            #                   interpolation=cv2.INTER_NEAREST)
+            # cv2.imshow("jac", jacc)
+            # break
+
+            bb_ = jac.T.dot(errs)
+            jac_t_jac += np.eye(jac.shape[1]) * LM_LAMBDA
+
+            params = np.stack([camera_to_params(self.cameras[i]) for i in idx])
+            delta = np.linalg.solve(jac_t_jac, bb_).reshape(params.shape)
+            params -= delta
+
+            # update cameras only if the result improves
+            cams = self.cameras.copy()
+            for ind, param in zip(idx, params):
+                cams[ind] = params_to_camera(param)
+
+            errs = residuals(cams, self.matches)
+            err = loss(errs)
+            if err < best_err:
+                best_err = err
+                self.cameras = cams
+            else:
+                n_not_improved += 1
+                if n_not_improved > 5:
+                    break
+            logging.debug(f"It #{it_} error: {err}")
+        logging.debug(f"Final error: {best_err}")
+
+
+def traverse(imgs, matches):
+    """Traverse connected matches by visiting the best matches first."""
+    # find starting point
+    idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
+                              for j in matches[i].keys()])
+    src = idx[np.argmax(scores)]
+    intr = intrinsics(np.median([get_focal(hom) for hom in homs]))
+
+    iba = IncrementalBundleAdjuster(len(imgs))
+    iba.cameras[src] = Image(None, np.eye(3), intr)
+
+    qq_ = [(-matches[src][j][2], src, j) for j in matches[src].keys()]
+    heapq.heapify(qq_)
+
+    while True:
+        try:
+            _, src, dst = heapq.heappop(qq_)
+        except IndexError:
+            break
+        if iba.cameras[dst] is not None:  # already estimated
+            continue
+
+        hom = matches[dst][src][1]
+        rot = to_rotation(np.linalg.inv(intr).dot(hom.dot(intr)))
+        rot = iba.cameras[src].rot.dot(rot)
+
+        iba.cameras[dst] = Image(None, rot, intr)
+        iba.add(src, dst, matches[dst][src][0])
+
+        for new in matches[dst].keys():
+            heapq.heappush(qq_, (-matches[dst][new][2], dst, new))
+        # if len(iba.matches) >= 2:
+        #     break
+
+    # images are needed only for stitching, add after optimization
+    cameras = iba.cameras
+    for idx, img in enumerate(imgs):
+        if cameras[idx] is not None:
+            cameras[idx].img = img
+
+    return [c for c in cameras if c is not None]
+
+
+def straighten(rots):
+    """Global rotation to have the x axis on the same plane."""
+    cov = np.cov(np.stack([rot[0] for rot in rots], axis=-1))
+    _, _, vv_ = np.linalg.svd(cov)
+    v_y = vv_[2]
+    v_z = np.sum(np.stack([rot[2] for rot in rots], axis=0), axis=0)
+    v_x = np.cross(v_y, v_z)
+    v_x /= np.linalg.norm(v_x)
+    v_z = np.cross(v_x, v_y)
+
+    rot_g = np.stack([v_x, v_y, v_z], axis=-1)
+    return [rot.dot(rot_g) for rot in rots]
 
 
 #

@@ -44,6 +44,13 @@ class TestHomography(unittest.TestCase):
         new_rots = np.stack(ba.straighten(new_rots), axis=0)
         npt.assert_almost_equal(new_rots, np.stack(rots, axis=0))
 
+    @staticmethod
+    def test_camera_params():
+        """Test if conversion to camera and back gives the identity."""
+        params = np.random.randn(6)
+        new_params = ba.camera_to_params(ba.params_to_camera(params))
+        npt.assert_almost_equal(new_params, params)
+
 
 class TestWarp(unittest.TestCase):
     """Test warping functions."""
