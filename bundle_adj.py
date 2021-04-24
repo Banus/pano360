@@ -1,6 +1,7 @@
 """Estimate the camera parameters with bundle adjustment."""
 import argparse
 import heapq
+import logging
 import os
 from dataclasses import dataclass
 
@@ -15,6 +16,7 @@ MAX_RESOLUTION = 1400
 # bundle adjustment parameters
 PARAMS_PER_CAMERA = 6
 TERMS_PER_MATCH = 2
+LM_LAMBDA = 5    # Levenberg–Marquardt regularization
 
 
 @dataclass
@@ -35,7 +37,7 @@ class Image:
         return self.intr.dot(self.rot.T)
 
 
-def _hom(cm1, cm2):
+def _hom_to_from(cm1, cm2):
     """Homography between two cameras."""
     return (cm1.intr.dot(cm1.rot)).dot(cm2.rot.T.dot(np.linalg.inv(cm2.intr)))
 
@@ -132,25 +134,39 @@ def straighten(rots):
     return [rot.dot(rot_g) for rot in rots]
 
 
+def idx_to_keypoints(matches, kpts):
+    """Replace keypoint indices with their coordinates."""
+    def _i_to_k(matches, kpt1, kpt2):
+        return np.concatenate([kpt1[matches[:, 0]], kpt2[matches[:, 1]]],
+                              axis=1)
+
+    # homogeneous coordinates
+    kpts = [np.concatenate([kp, np.ones((kp.shape[0], 1))], axis=1)
+            for kp in kpts]
+
+    matches = matches.item()   # unpack dictionary
+    # add match confidence (number of inliers)
+    matches = {i: {j: (_i_to_k(m, kpts[i], kpts[j]), h, len(m))
+                   for j, (m, h) in col.items()} for i, col in matches.items()}
+
+    return matches
+
+
 #
 # Bundle adjustment
 #
 
 def traverse(imgs, matches):
     """Traverse connected matches by visiting the best matches first."""
-    matches = matches.item()   # unpack dictionary
-    # add match confidence (number of inliers)
-    matches = {i: {j: (m, h, len(m)) for j, (m, h) in col.items()}
-               for i, col in matches.items()}
-
     # find starting point
     idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
                               for j in matches[i].keys()])
     src = idx[np.argmax(scores)]
     intr = intrinsics(np.median([get_focal(hom) for hom in homs]))
 
-    rots = [None] * len(imgs)
-    rots[src] = np.eye(3)
+    iba = IncrementalBundleAdjuster(len(imgs))
+    iba.cameras[src] = Image(imgs[src], np.eye(3), intr)
+
     qq_ = [(-matches[src][j][2], src, j) for j in matches[src].keys()]
     heapq.heapify(qq_)
 
@@ -159,22 +175,35 @@ def traverse(imgs, matches):
             score, src, dst = heapq.heappop(qq_)
         except IndexError:
             break
-        if rots[dst] is not None:  # already estimated
+        if iba.cameras[dst] is not None:  # already estimated
             continue
 
         hom = matches[dst][src][1]
         rot = to_rotation(np.linalg.inv(intr).dot(hom.dot(intr)))
-        rots[dst] = rots[src].dot(rot)
+        rot = iba.cameras[src].rot.dot(rot)
+
+        iba.cameras[dst] = Image(imgs[dst], rot, intr)
+        iba.add(src, dst, matches[dst][src][0])
+
         for new in matches[dst].keys():
             heapq.heappush(qq_, (-matches[dst][new][2], dst, new))
 
-    # rots = straighten(rots)
-    return [Image(im, rot, intr) for im, rot in zip(imgs, rots)]
+    return iba.cameras
 
 
-def residuals():
+def residuals(cameras, matches):
     """Find estimation errors."""
-    pass
+    res = []
+    for i, j, match in matches:
+        hom = _hom_to_from(cameras[i], cameras[j])
+        trans = hom.dot(match[:, 3:6].T)
+        res.append((trans / trans[[-1], :] - match[:, :3].T)[:-1])
+    return np.concatenate(res, axis=1).ravel()
+
+
+def loss(res):
+    """Error function: Residual Mean Squared Error (RMSE)."""
+    return np.sqrt(np.mean(np.square(res)))
 
 
 def dr_dvi(rot):
@@ -182,7 +211,8 @@ def dr_dvi(rot):
     rad = mat_to_angle(rot)
     vsqr = np.sum(np.square(rad))
     if vsqr < 1e-14:
-        return np.eye(3)
+        return np.stack([_cross_mat([1, 0, 0]), _cross_mat([0, 1, 0]),
+                         _cross_mat([0, 0, 1])])
 
     ire = np.eye(3) - rot
     res = np.stack([_cross_mat(rad)*r for r in rad])
@@ -193,25 +223,108 @@ def dr_dvi(rot):
     return res.dot(rot) / vsqr
 
 
-def bundle_adjustment(regions, kpts, matches):
-    """Refine the camera parameters."""
-    m_offs = np.cumsum([0] + [len(m) for m in matches])
-    n_match, m_offs = m_offs[-1], m_offs[:-1]
-    # hack: create match dict for now
-    mdict = {(i, i+1): m for i, m in enumerate(matches[:-1])}
-    mdict[(len(matches)-1, 0)] = matches[-1]
+# derivatives of the intrinsic matrix w.r.t. its parameters
+_DKDFOCAL = np.float32([[1, 0, 0], [0, 1, 0], [0, 0, 0]])
+_DKDPPX = np.float32([[0, 0, 1], [0, 0, 0], [0, 0, 0]])
+_DKDPPY = np.float32([[0, 0, 0], [0, 0, 1], [0, 0, 0]])
 
-    np_cam = PARAMS_PER_CAMERA * len(regions)
-    print(n_match, np_cam)
 
-    # jac = np.zeros((TERMS_PER_MATCH * n_match, np_cam), dtype="float32")
-    # jac_t_jac = np.zeros((np_cam, np_cam)*2, dtype="float32")
+def _jacobian_symbolic(cameras, matches):
+    """Compute the symbolic Jacobian for the bundler."""
+    m_offs = np.cumsum([0] + [len(m) for _, _, m in matches])
+    n_match = m_offs[-1]
 
-    # drs = [dr_dvi(r.rot) for r in regions]  # cache rot derivatives
-    # for idx, ((i, j), match) in enumerate(mdict.items()):
-    #     pass
+    cam_idx = [i for i, c in enumerate(cameras) if c is not None]
+    np_cam = PARAMS_PER_CAMERA * len(cam_idx)
 
-    return regions
+    jac = np.zeros((TERMS_PER_MATCH * n_match, np_cam))
+    jac_t_jac = np.zeros((np_cam, np_cam))
+
+    # cache rotation derivatives
+    drs = [dr_dvi(cameras[i].rot) for i in cam_idx]
+    for idx, (i, j, match) in enumerate(matches):
+        m_slice = slice(m_offs[idx]*TERMS_PER_MATCH,
+                        m_offs[idx+1]*TERMS_PER_MATCH)
+
+        hom = _hom_to_from(cameras[i], cameras[j])
+        from_R, to_R = cameras[i].rot, cameras[j].rot
+        from_K, to_K = cameras[i].intr, cameras[j].intr
+
+        pts = hom.dot(match[:, 3:6].T)
+        inv_z = 1 / pts[2]
+        dpdh = (pts[0]*inv_z*inv_z, pts[1]*inv_z*inv_z, inv_z)
+
+        def drdv(xx_):
+            """Differentiate different values w.r.t. the residuals."""
+            return np.concatenate([-xx_[0]*dpdh[2] + xx_[2]*dpdh[0],
+                                   -xx_[1]*dpdh[2] + xx_[2]*dpdh[1]])
+
+        # Jacobian
+        # first camera
+        u2_ = from_R.dot(to_R.T.dot(np.linalg.inv(to_K))).dot(
+            match[:, 3:6].T)
+
+        c_off_i = cam_idx.index(i)*PARAMS_PER_CAMERA
+        jac[m_slice, c_off_i] = drdv(_DKDFOCAL.dot(u2_))
+        jac[m_slice, c_off_i + 1] = drdv(_DKDPPX.dot(u2_))
+        jac[m_slice, c_off_i + 2] = drdv(_DKDPPY.dot(u2_))
+        # rotation
+        drdvi = drs[cam_idx.index(i)]
+        jac[m_slice, c_off_i + 3] = drdv(from_K.dot(drdvi[0].dot(u2_)))
+        jac[m_slice, c_off_i + 4] = drdv(from_K.dot(drdvi[1].dot(u2_)))
+        jac[m_slice, c_off_i + 5] = drdv(from_K.dot(drdvi[2].dot(u2_)))
+
+        # # second camera
+        u2_ = -np.linalg.inv(to_K).dot(match[:, 3:6].T)
+
+        c_off_j = cam_idx.index(j)*PARAMS_PER_CAMERA
+        jac[m_slice, c_off_j] = drdv(hom.dot(_DKDFOCAL).dot(u2_))
+        jac[m_slice, c_off_j + 1] = drdv(hom.dot(_DKDPPX).dot(u2_))
+        jac[m_slice, c_off_j + 2] = drdv(hom.dot(_DKDPPY).dot(u2_))
+        # rotation
+        drdvi_t = drs[cam_idx.index(j)].transpose(0, 2, 1)
+        jac[m_slice, c_off_j + 3] = drdv(hom.dot(drdvi_t[0].dot(u2_)))
+        jac[m_slice, c_off_j + 4] = drdv(hom.dot(drdvi_t[1].dot(u2_)))
+        jac[m_slice, c_off_j + 5] = drdv(hom.dot(drdvi_t[2].dot(u2_)))
+
+        # J^T J
+        i_slice = slice(c_off_i, c_off_i+PARAMS_PER_CAMERA)
+        j_slice = slice(c_off_j, c_off_j+PARAMS_PER_CAMERA)
+
+        jac_t_jac[i_slice, i_slice] = \
+            jac[m_slice, i_slice].T.dot(jac[m_slice, i_slice])
+        jac_t_jac[j_slice, j_slice] = \
+            jac[m_slice, j_slice].T.dot(jac[m_slice, j_slice])
+
+        cross_block = jac[m_slice, i_slice].T.dot(jac[m_slice, j_slice])
+        jac_t_jac[i_slice, j_slice] = cross_block
+        jac_t_jac[j_slice, i_slice] = cross_block.T
+
+    return jac, jac_t_jac
+
+
+class IncrementalBundleAdjuster:
+    """Bundle adjustment one image at a time."""
+
+    def __init__(self, n_cameras, incremental=True):
+        """Set bundler parameters."""
+        self.cameras = [None] * n_cameras
+        self.matches = []
+        self.is_incremental = incremental
+
+    def add(self, src, dst, match):
+        """Add a new image to the bundler."""
+        self.matches.append((src, dst, match))
+
+        if self.is_incremental and len(self.matches) <= 1:
+            self.optimize()
+
+    def optimize(self):
+        """Refine the camera parameters."""
+        errs = residuals(self.cameras, self.matches)
+        logging.debug(f"Initial error: {loss(errs)}")
+
+        jac, jac_t_jac = _jacobian_symbolic(self.cameras, self.matches)
 
 
 #
@@ -328,9 +441,9 @@ def main():
     imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
 
     arr = np.load(f"matches_{name}.npz", allow_pickle=True)
-    _, matches = arr['kpts'], arr['matches']
+    kpts, matches = arr['kpts'], arr['matches']
 
-    regions = traverse(imgs, matches)
+    regions = traverse(imgs, idx_to_keypoints(matches, kpts))
     # regions = bundle_adjustment(regions, kpts, matches)
 
     mosaic = stitch(regions)
@@ -341,4 +454,5 @@ def main():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
     main()
