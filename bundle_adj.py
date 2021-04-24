@@ -1,4 +1,6 @@
 """Estimate the camera parameters with bundle adjustment."""
+import argparse
+import heapq
 import os
 from dataclasses import dataclass
 
@@ -116,22 +118,6 @@ def to_rotation(rot):
     return rot
 
 
-def absolute_rotations(homs, kints):
-    """Find camera rotation w.r.t. a reference given homographies."""
-    rots = [to_rotation(np.linalg.inv(kint).dot(hom.dot(kint)))
-            for hom, kint in zip(homs, kints)]
-
-    # mid point as reference to reduce drift
-    mid = len(rots) // 2
-    rot_r = [rots[mid]]
-    for rot in rots[mid+1:]:
-        rot_r.append(rot.dot(rot_r[-1]))
-    rot_l = [np.eye(3)]
-    for rot in rots[:mid]:
-        rot_l.append(rot.T.dot(rot_l[-1]))
-    return rot_l[::-1] + rot_r
-
-
 def straighten(rots):
     """Global rotation to have the x axis on the same plane."""
     cov = np.cov(np.stack([rot[0] for rot in rots], axis=-1))
@@ -150,17 +136,40 @@ def straighten(rots):
 # Bundle adjustment
 #
 
-def initial_estimate(imgs, homs):
-    """Find an initial estimate for estrinsics and intrinsics."""
-    focals = [get_focal(hom) for hom in homs]
-    homs = [np.linalg.inv(hom) for hom in homs]
-    foc = np.median([f for f in focals])
+def traverse(imgs, matches):
+    """Traverse connected matches by visiting the best matches first."""
+    matches = matches.item()   # unpack dictionary
+    # add match confidence (number of inliers)
+    matches = {i: {j: (m, h, len(m)) for j, (m, h) in col.items()}
+               for i, col in matches.items()}
 
-    kints = [intrinsics(foc)] * len(imgs)
-    rots = absolute_rotations(homs, kints)
-    rots = straighten(rots)
+    # find starting point
+    idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
+                              for j in matches[i].keys()])
+    src = idx[np.argmax(scores)]
+    intr = intrinsics(np.median([get_focal(hom) for hom in homs]))
 
-    return [Image(im, rot, k) for im, rot, k in zip(imgs, rots, kints)]
+    rots = [None] * len(imgs)
+    rots[src] = np.eye(3)
+    qq_ = [(-matches[src][j][2], src, j) for j in matches[src].keys()]
+    heapq.heapify(qq_)
+
+    while True:
+        try:
+            score, src, dst = heapq.heappop(qq_)
+        except IndexError:
+            break
+        if rots[dst] is not None:  # already estimated
+            continue
+
+        hom = matches[dst][src][1]
+        rot = to_rotation(np.linalg.inv(intr).dot(hom.dot(intr)))
+        rots[dst] = rots[src].dot(rot)
+        for new in matches[dst].keys():
+            heapq.heappush(qq_, (-matches[dst][new][2], dst, new))
+
+    # rots = straighten(rots)
+    return [Image(im, rot, intr) for im, rot in zip(imgs, rots)]
 
 
 def residuals():
@@ -303,17 +312,26 @@ def stitch(regions):
 
 def main():
     """Script entry point."""
-    base_path = "../data/ppwwyyxx/CMU2"
+    parser = argparse.ArgumentParser(description="Stitch images.")
+    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/CMU2",
+                        help="directory with the images to process.")
+    args = parser.parse_args()
 
-    imgs = [cv2.imread(os.path.join(base_path, f"medium{i:02d}.JPG"))
-            for i in range(13)]
+    exts = [".jpg", ".png", ".bmp"]
+    exts += [ex.upper() for ex in exts]
+
+    name = os.path.basename(args.path)
+    files = [f for f in os.listdir(args.path)
+             if any([f.endswith(ext) for ext in exts])]
+
+    imgs = [cv2.imread(os.path.join(args.path, f)) for f in files]
     imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
 
-    arr = np.load("matches2.npz", allow_pickle=True)
-    kpts, matches, homs = arr['kpts'], arr['matches'], arr['homs']
+    arr = np.load(f"matches_{name}.npz", allow_pickle=True)
+    _, matches = arr['kpts'], arr['matches']
 
-    regions = initial_estimate(imgs, homs)
-    regions = bundle_adjustment(regions, kpts, matches)
+    regions = traverse(imgs, matches)
+    # regions = bundle_adjustment(regions, kpts, matches)
 
     mosaic = stitch(regions)
     cv2.imshow("Mosaic", mosaic)

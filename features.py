@@ -2,14 +2,18 @@
 
 Loosely based on: https://momohuang.github.io/Panorama/
 """
+import argparse
+import logging
 import math
 import os
-import numpy as np
+from collections import defaultdict
 
+import numpy as np
 import scipy.ndimage as ndi
 import cv2
 
-DSIZE = 8  # descriptor size
+DSIZE = 8         # descriptor size
+N_MIN_MATCH = 8   # minimum number of point matches
 
 
 def gaussian_filter(img, sigma=1.0):
@@ -101,7 +105,7 @@ def rot_mat(theta, pp_):
                     dtype="float32")
 
 
-def descriptors(src, xx_, yy_, scale):
+def _msop_descriptors(src, xx_, yy_, scale):
     """Get oriented MSOP descriptors."""
     points, desc = [], []
     g_x = gaussian_filter(cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=3))
@@ -125,7 +129,7 @@ def descriptors(src, xx_, yy_, scale):
     return points, desc
 
 
-def msop(img, max_feat=(5000, 100, 25, 10)):
+def msop_detect(img, max_feat=(5000, 100, 25, 10)):
     """Extract MSOP features."""
     gray = np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
     points, descs = [], []
@@ -143,7 +147,7 @@ def msop(img, max_feat=(5000, 100, 25, 10)):
         pts = ssc(np.stack([x_lvl, y_lvl], axis=1), gray.shape, maxf)
         x_lvl, y_lvl = np.stack(pts, axis=1)
 
-        pts, dsc = descriptors(gray, x_lvl, y_lvl, 2**lvl)
+        pts, dsc = _msop_descriptors(gray, x_lvl, y_lvl, 2**lvl)
         points.append(pts)
         descs.append(dsc)
 
@@ -184,6 +188,29 @@ def plot_descs(descs, side=25):
                       interpolation=cv2.INTER_NEAREST)
 
 
+def sift_detector():
+    """Closure, return a SIFT detecting function."""
+    sift = cv2.xfeatures2d.SIFT_create()
+
+    def _detect(img):
+        kp_, des = sift.detectAndCompute(img, None)
+        des = np.sqrt(des/(des.sum(axis=1, keepdims=True) + 1e-7))  # RootSIFT
+        return kp_, des
+
+    return _detect
+
+
+def msop_detector(max_feat=(5000, 100, 25, 10)):
+    """Closure, returns a MSOP detector."""
+    def _detect(img):
+        kp_, des = msop_detect(img, max_feat)
+        kp_ = [cv2.KeyPoint(p[1], p[0], p[2]) for p in kp_]
+        des = des.reshape(-1, 64)
+
+        return kp_, des
+    return _detect
+
+
 #
 # Feature matching
 #
@@ -208,51 +235,51 @@ def _match_hom(pt1, pt2, des1, des2):
     """Match points, estimate homography and return inlier matches."""
     good = flann_matching(des1, des2)
     match = np.int32([(m.queryIdx, m.trainIdx) for m in good])
+    if len(match) < N_MIN_MATCH:
+        return None, None
 
     query_pts = np.float32([pt1[m] for m, _ in match])
     train_pts = np.float32([pt2[m] for _, m in match])
     hom, mask = cv2.findHomography(query_pts, train_pts, cv2.RANSAC)
 
-    return match[mask], hom
+    return match[mask].squeeze(), hom
 
 
-def sift_matching(imgs):
-    """Find SIFT correspondences between images in a list."""
-    sift = cv2.xfeatures2d.SIFT_create()
+def _reverse(match, hom):
+    """Find the matches and homography for the image is reverse order."""
+    return np.fliplr(match), np.linalg.inv(hom)
 
-    kpts, matches, homs, descs = [], [], [], []
+
+def matching(imgs, detect=sift_detector()):
+    """Find correspondences between images in a list."""
+    kpts, descs = [], []
     for i, img in enumerate(imgs):
-        print(f"Processing image #{i+1}")
+        logging.debug(f"Processing image #{i+1}")
 
-        kp_, des = sift.detectAndCompute(img, None)
-        des = np.sqrt(des/(des.sum(axis=1, keepdims=True) + 1e-7))  # RootSIFT
+        kp_, des = detect(img)
         cent = np.array([img.shape[1], img.shape[0]])
         kpts.append(np.float32([kp.pt - cent for kp in kp_]))
-
-        if descs:
-            match, hom = _match_hom(kpts[-2], kpts[-1], descs[-1], des)
-            matches.append(match)
-            homs.append(hom)
         descs.append(des)
 
-    # close the loop
-    match, hom = _match_hom(kpts[-1], kpts[0], descs[-1], descs[0])
-    matches.append(match)
-    homs.append(hom)
+    # match all possible pairs
+    matches, n_imgs = defaultdict(dict), len(imgs)
+    for src in range(n_imgs):
+        for dst in range(src+1, n_imgs):
+            logging.debug(f"Matching {src+1}-{dst+1}")
+            match, hom = _match_hom(
+                kpts[src], kpts[dst], descs[src], descs[dst])
+            if hom is None:
+                continue
 
-    kpts = np.array(kpts, dtype=np.object)
-    matches = np.array(matches, dtype=np.object)
-    np.savez("matches2.npz", kpts=kpts, matches=matches, homs=homs)
-    # im_out = cv2.warpPerspective(img1, hom, (img2.shape[1], img2.shape[0]))
+            matches[src][dst] = (match, hom)
+            matches[dst][src] = _reverse(match, hom)
+
+    return np.array(kpts, dtype=np.object), np.array(matches, dtype=np.object)
 
 
-def msop_matching(img1, img2):
+def match_images(img1, img2, detect=sift_detector()):
     """Find MSOP correspondences between images."""
-    (kp1, des1), (kp2, des2) = msop(img1), msop(img2)
-    kp1 = [cv2.KeyPoint(p[1], p[0], p[2]) for p in kp1]
-    kp2 = [cv2.KeyPoint(p[1], p[0], p[2]) for p in kp2]
-    des1, des2 = des1.reshape(-1, 64), des2.reshape(-1, 64)
-
+    (kp1, des1), (kp2, des2) = detect(img1), detect(img2)
     good = flann_matching(des1, des2)
 
     src_pts = np.array([kp1[m.queryIdx].pt for m in good]).reshape((-1, 1, 2))
@@ -269,21 +296,25 @@ def msop_matching(img1, img2):
 # MSOP from: https://github.com/momohuang/Panorama/blob/master/MSOP.cpp
 def main():
     """Script entry point."""
-    base_path = "../data/ppwwyyxx/CMU2"
+    parser = argparse.ArgumentParser(description="Extract features.")
+    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/CMU1",
+                        help="directory with the images to process.")
+    args = parser.parse_args()
 
-    imgs = [cv2.imread(os.path.join(base_path, f"medium{i:02d}.JPG"))
-            for i in range(13)]
+    exts = [".jpg", ".png", ".bmp"]
+    exts += [ex.upper() for ex in exts]
+
+    name = os.path.basename(args.path)
+    files = [f for f in os.listdir(args.path)
+             if any([f.endswith(ext) for ext in exts])]
+
+    imgs = [cv2.imread(os.path.join(args.path, f)) for f in files]
     imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
 
-    sift_matching(imgs)
-
-    # points, descs = msop(img1)
-
-    # cv2.imshow('tiles', plot_descs(descs))
-    # cv2.imshow('dst', plot_points(img1.copy(), points))
-    # if cv2.waitKey(0) & 0xff == 27:
-    #     cv2.destroyAllWindows()
+    kpts, matches = matching(imgs)
+    np.savez(f"matches_{name}.npz", kpts=kpts, matches=matches)
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
     main()
