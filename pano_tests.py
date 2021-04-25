@@ -30,7 +30,7 @@ class TestHomography(unittest.TestCase):
     def test_camera_inverse():
         """Test if camera transform and its inverse are correct."""
         cam = ba.Image(None, ba.rotation_to_mat(), bl.intrinsics(1e3))
-        npt.assert_almost_equal(cam.hom().dot(cam.inv_hom()), np.eye(3))
+        npt.assert_almost_equal(cam.hom().dot(cam.proj()), np.eye(3))
 
     @staticmethod
     def test_straighten():
@@ -40,8 +40,9 @@ class TestHomography(unittest.TestCase):
         rots = [ba.rotation_to_mat(step * i) for i in range(n_cams)]
 
         tilt = ba.rotation_to_mat(np.array([0.1, 0, 0]))
-        new_rots = [rot.dot(tilt) for rot in rots]   # change the vertical
+        new_rots = [rot.dot(tilt) for rot in rots]     # change the vertical
         new_rots = np.stack(ba.straighten(new_rots), axis=0)
+        new_rots = new_rots.dot(np.diag([-1, -1, 1]))  # orientation ambiguity
         npt.assert_almost_equal(new_rots, np.stack(rots, axis=0))
 
     @staticmethod

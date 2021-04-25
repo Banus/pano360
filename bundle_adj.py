@@ -31,12 +31,12 @@ class Image:
     range: tuple = (np.zeros(2), np.zeros(2))
 
     def hom(self):
-        """Homography to normalized coordinates."""
-        return self.rot.dot(np.linalg.inv(self.intr))
+        """Homography from pixel to normalized coordinates."""
+        return self.rot.T.dot(np.linalg.inv(self.intr))
 
-    def inv_hom(self):
-        """Return inverse camera transform."""
-        return self.intr.dot(self.rot.T)
+    def proj(self):
+        """Return camera projection transform."""
+        return self.intr.dot(self.rot)
 
 
 def _hom_to_from(cm1, cm2):
@@ -162,7 +162,7 @@ def residuals(cameras, matches):
     """Find estimation errors."""
     res = []
     for i, j, match in matches:
-        hom = _hom_to_from(cameras[i], cameras[j])
+        hom = _hom_to_from(cameras[j], cameras[i])
         trans = hom.dot(match[:, 3:6].T)
         res.append((trans / trans[[-1], :] - match[:, :3].T)[:-1])
     return np.concatenate(res, axis=1).ravel()
@@ -216,43 +216,44 @@ def _jacobian_symbolic(cameras, matches):
         hom = _hom_to_from(cameras[i], cameras[j])
         from_R, to_R = cameras[i].rot, cameras[j].rot
         from_K, to_K = cameras[i].intr, cameras[j].intr
+        to_Kinv = np.linalg.inv(to_K)
 
         pts = hom.dot(match[:, 3:6].T)
         inv_z = 1 / pts[2]
-        dpdh = (pts[0]*inv_z*inv_z, pts[1]*inv_z*inv_z, inv_z)
+        dpdh = (pts[0]*inv_z*inv_z, pts[1]*inv_z*inv_z, -inv_z)
 
         def drdv(xx_):
             """Differentiate different values w.r.t. the residuals."""
-            return np.concatenate([-xx_[0]*dpdh[2] + xx_[2]*dpdh[0],
-                                   -xx_[1]*dpdh[2] + xx_[2]*dpdh[1]])
+            return np.concatenate([xx_[0]*dpdh[2] + xx_[2]*dpdh[0],
+                                   xx_[1]*dpdh[2] + xx_[2]*dpdh[1]])
 
         # Jacobian
         # first camera
-        u2_ = from_R.dot(to_R.T.dot(np.linalg.inv(to_K))).dot(
-            match[:, 3:6].T)
+        u2_ = from_R.dot(to_R.T).dot(to_Kinv).dot(match[:, 3:6].T)
 
         c_off_i = cam_idx.index(i)*PARAMS_PER_CAMERA
-        jac[m_slice, c_off_i] = -drdv(_DKDFOCAL.dot(u2_))
-        jac[m_slice, c_off_i + 1] = -drdv(_DKDPPX.dot(u2_))
-        jac[m_slice, c_off_i + 2] = -drdv(_DKDPPY.dot(u2_))
+        jac[m_slice, c_off_i] = drdv(_DKDFOCAL.dot(u2_))
+        jac[m_slice, c_off_i + 1] = drdv(_DKDPPX.dot(u2_))
+        jac[m_slice, c_off_i + 2] = drdv(_DKDPPY.dot(u2_))
         # rotation
         drdvi = drs[cam_idx.index(i)]
-        jac[m_slice, c_off_i + 3] = drdv(from_K.dot(drdvi[0].T.dot(u2_)))
-        jac[m_slice, c_off_i + 4] = drdv(from_K.dot(drdvi[1].T.dot(u2_)))
-        jac[m_slice, c_off_i + 5] = drdv(from_K.dot(drdvi[2].T.dot(u2_)))
+        u2_ = to_R.T.dot(to_Kinv).dot(match[:, 3:6].T)
+        jac[m_slice, c_off_i + 3] = drdv(from_K.dot(drdvi[0]).dot(u2_))
+        jac[m_slice, c_off_i + 4] = drdv(from_K.dot(drdvi[1]).dot(u2_))
+        jac[m_slice, c_off_i + 5] = drdv(from_K.dot(drdvi[2]).dot(u2_))
 
-        # # second camera
-        u2_ = -np.linalg.inv(to_K).dot(match[:, 3:6].T)
+        # second camera
+        u2_ = to_Kinv.dot(match[:, 3:6].T)
 
         c_off_j = cam_idx.index(j)*PARAMS_PER_CAMERA
-        jac[m_slice, c_off_j] = -drdv(hom.dot(_DKDFOCAL).dot(u2_))
-        jac[m_slice, c_off_j + 1] = -drdv(hom.dot(_DKDPPX).dot(u2_))
-        jac[m_slice, c_off_j + 2] = -drdv(hom.dot(_DKDPPY).dot(u2_))
+        jac[m_slice, c_off_j] = drdv(hom.dot(_DKDFOCAL).dot(-u2_))
+        jac[m_slice, c_off_j + 1] = drdv(hom.dot(_DKDPPX).dot(-u2_))
+        jac[m_slice, c_off_j + 2] = drdv(hom.dot(_DKDPPY).dot(-u2_))
         # rotation
-        drdvi, hom = drs[cam_idx.index(j)], from_K.dot(from_R)
-        jac[m_slice, c_off_j + 3] = drdv(hom.dot(drdvi[0].T.dot(u2_)))
-        jac[m_slice, c_off_j + 4] = drdv(hom.dot(drdvi[1].T.dot(u2_)))
-        jac[m_slice, c_off_j + 5] = drdv(hom.dot(drdvi[2].T.dot(u2_)))
+        drdvi, hom2 = drs[cam_idx.index(j)], from_K.dot(from_R)
+        jac[m_slice, c_off_j + 3] = drdv(hom2.dot(drdvi[0].T).dot(u2_))
+        jac[m_slice, c_off_j + 4] = drdv(hom2.dot(drdvi[1].T).dot(u2_))
+        jac[m_slice, c_off_j + 5] = drdv(hom2.dot(drdvi[2].T).dot(u2_))
 
         # J^T J
         i_slice = slice(c_off_i, c_off_i+PARAMS_PER_CAMERA)
@@ -300,15 +301,19 @@ def _jacobian_numeric(cameras, matches):
 class IncrementalBundleAdjuster:
     """Bundle adjustment one image at a time."""
 
-    def __init__(self, n_cameras, incremental=True):
+    def __init__(self, n_cameras, incremenntal=True):
         """Set bundler parameters."""
         self.cameras = [None] * n_cameras
         self.matches = []
-        self.is_incremental = incremental
+        self.is_incremental = incremenntal
 
-    def add(self, src, dst, match):
-        """Add a new image to the bundler."""
-        self.matches.append((src, dst, match))
+    def add(self, idx, camera, matches):
+        """Add a new camerato the bundler."""
+        self.cameras[idx] = camera
+        for new, cam in enumerate(self.cameras):
+            if cam is None or new not in matches[idx]:
+                continue
+            self.matches.append((new, idx, matches[idx][new][0]))
 
         if self.is_incremental:
             self.optimize()
@@ -323,17 +328,7 @@ class IncrementalBundleAdjuster:
         n_not_improved = 0   # exit loop if the loss doesn't improve
         for it_ in range(LM_MAX_ITER):
             # Levenberg–Marquardt iteration
-            jac, jac_t_jac = _jacobian_symbolic(self.cameras, self.matches)
-
-            # jac2, jac_t_jac2 = _jacobian_numeric(self.cameras, self.matches)
-            # mod = 2*np.abs(jac2)
-            # mod[mod < 1e-6] = 1
-            # diff = np.abs(jac-jac2)/mod
-            # print(np.max(diff))
-            # jacc = cv2.resize(diff.T, None, fx=0.5, fy=20,
-            #                   interpolation=cv2.INTER_NEAREST)
-            # cv2.imshow("jac", jacc)
-            # break
+            jac, jac_t_jac = _jacobian_numeric(self.cameras, self.matches)
 
             bb_ = jac.T.dot(errs)
             jac_t_jac += np.eye(jac.shape[1]) * LM_LAMBDA
@@ -349,7 +344,7 @@ class IncrementalBundleAdjuster:
 
             errs = residuals(cams, self.matches)
             err = loss(errs)
-            if err < best_err:
+            if err < best_err - 1e-6:
                 best_err = err
                 self.cameras = cams
             else:
@@ -360,7 +355,7 @@ class IncrementalBundleAdjuster:
         logging.debug(f"Final error: {best_err}")
 
 
-def traverse(imgs, matches):
+def traverse(imgs, matches, use_straighten=True):
     """Traverse connected matches by visiting the best matches first."""
     # find starting point
     idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
@@ -382,17 +377,15 @@ def traverse(imgs, matches):
         if iba.cameras[dst] is not None:  # already estimated
             continue
 
-        hom = matches[dst][src][1]
+        hom = matches[src][dst][1]
         rot = to_rotation(np.linalg.inv(intr).dot(hom.dot(intr)))
-        rot = iba.cameras[src].rot.dot(rot)
+        rot = rot.dot(iba.cameras[src].rot)
 
-        iba.cameras[dst] = Image(None, rot, intr)
-        iba.add(src, dst, matches[dst][src][0])
+        # add camera and all its valid matches
+        iba.add(dst, Image(None, rot, intr), matches)
 
         for new in matches[dst].keys():
             heapq.heappush(qq_, (-matches[dst][new][2], dst, new))
-        # if len(iba.matches) >= 2:
-        #     break
 
     # images are needed only for stitching, add after optimization
     cameras = iba.cameras
@@ -400,7 +393,14 @@ def traverse(imgs, matches):
         if cameras[idx] is not None:
             cameras[idx].img = img
 
-    return [c for c in cameras if c is not None]
+    cameras = [c for c in cameras if c is not None]
+    if use_straighten:
+        rots = [c.rot for c in cameras if c is not None]
+        rots = straighten(rots)
+        for cam, rot in zip(cameras, rots):
+            cam.rot = rot
+
+    return cameras
 
 
 def straighten(rots):
@@ -413,6 +413,11 @@ def straighten(rots):
     v_x /= np.linalg.norm(v_x)
     v_z = np.cross(v_x, v_y)
 
+    # ensure that the vertical versor points up
+    sign = np.sum([v_x.dot(rot[0]) for rot in rots])
+    if sign < 0:
+        v_x, v_y = -v_x, -v_y
+
     rot_g = np.stack([v_x, v_y, v_z], axis=-1)
     return [rot.dot(rot_g) for rot in rots]
 
@@ -421,7 +426,7 @@ def straighten(rots):
 # Reprojection
 #
 
-def _proj_img_range_border(rot, shape, kint):
+def _proj_img_range_border(shape, hom):
     """Estimate the extent of the image after projection."""
     nel = 100
     height, width = shape
@@ -435,7 +440,7 @@ def _proj_img_range_border(rot, shape, kint):
         np.stack([side_x, np.full(nel, height), np.ones(nel)], axis=1)])
     borders = borders - np.array([width/2, height/2, 0])
 
-    pts = SphProj.hom2proj(rot.dot(np.linalg.inv(kint).dot(borders.T)).T)
+    pts = SphProj.hom2proj(hom.dot(borders.T).T)
     return np.min(pts, axis=0), np.max(pts, axis=0)   # range
 
 
@@ -476,14 +481,14 @@ def estimate_resolution(regions):
 def stitch(regions):
     """Stitch the images together."""
     for reg in regions:
-        reg.range = _proj_img_range_corners(reg.img.shape[:2], reg.hom())
+        reg.range = _proj_img_range_border(reg.img.shape[:2], reg.hom())
 
     resolution, im_range = estimate_resolution(regions)
     target = (im_range[1] - im_range[0]) / resolution
 
     shape = tuple(int(t) for t in np.round(target))[::-1]  # y,x order
     mosaic = np.zeros(shape + (3,), dtype=np.uint8)        # RGBA image
-    for reg in regions:
+    for idx, reg in enumerate(regions):
         bottom = np.round((reg.range[0] - im_range[0])/resolution)
         top = np.round((reg.range[1] - im_range[0])/resolution)
         bottom, top = bottom.astype(np.int32), top.astype(np.int32)
@@ -496,11 +501,13 @@ def stitch(regions):
         xx_ = SphProj.proj2hom(np.stack([x_i, y_i], axis=-1).reshape(-1, 2))
 
         # transform to the original image coordinates
-        xx_ = reg.inv_hom().dot(xx_.T).T.astype(np.float32)
-        x_pr = xx_[:, :-1] / xx_[:, [-1]] + np.float32([ww_/2, hh_/2])
-        x_pr = x_pr.reshape(top[1]-bottom[1], top[0]-bottom[0], -1)
-        mask = (x_pr[..., 0] < 0) | (x_pr[..., 0] >= ww_) | \
-               (x_pr[..., 1] < 0) | (x_pr[..., 1] >= hh_)
+        xx_ = reg.proj().dot(xx_.T).T.astype(np.float32)
+        xx_ = xx_.reshape(top[1]-bottom[1], top[0]-bottom[0], -1)
+        mask = xx_[..., -1] < 0  # behind the screen
+
+        x_pr = xx_[..., :-1] / xx_[..., [-1]] + np.float32([ww_/2, hh_/2])
+        mask |= (x_pr[..., 0] < 0) | (x_pr[..., 0] >= ww_) | \
+                (x_pr[..., 1] < 0) | (x_pr[..., 1] >= hh_)
         x_pr[mask] = -1
 
         # paste only valid pixels
@@ -534,8 +541,6 @@ def main():
     kpts, matches = arr['kpts'], arr['matches']
 
     regions = traverse(imgs, idx_to_keypoints(matches, kpts))
-    # regions = bundle_adjustment(regions, kpts, matches)
-
     mosaic = stitch(regions)
     cv2.imshow("Mosaic", mosaic)
 

@@ -241,6 +241,7 @@ def _match_hom(pt1, pt2, des1, des2):
     query_pts = np.float32([pt1[m] for m, _ in match])
     train_pts = np.float32([pt2[m] for _, m in match])
     hom, mask = cv2.findHomography(query_pts, train_pts, cv2.RANSAC)
+    mask = (mask != 0).squeeze()    # boolean mask
 
     return match[mask].squeeze(), hom
 
@@ -257,7 +258,7 @@ def matching(imgs, detect=sift_detector()):
         logging.debug(f"Processing image #{i+1}")
 
         kp_, des = detect(img)
-        cent = np.array([img.shape[1], img.shape[0]])
+        cent = np.array([img.shape[1], img.shape[0]]) / 2
         kpts.append(np.float32([kp.pt - cent for kp in kp_]))
         descs.append(des)
 
@@ -278,13 +279,13 @@ def matching(imgs, detect=sift_detector()):
 
 
 def match_images(img1, img2, detect=sift_detector()):
-    """Find MSOP correspondences between images."""
+    """Find and draw correspondences between images."""
     (kp1, des1), (kp2, des2) = detect(img1), detect(img2)
     good = flann_matching(des1, des2)
 
     src_pts = np.array([kp1[m.queryIdx].pt for m in good]).reshape((-1, 1, 2))
     dst_pts = np.array([kp2[m.trainIdx].pt for m in good]).reshape((-1, 1, 2))
-    _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC)
     mask = mask.ravel().tolist()
 
     draw_params = dict(matchColor=(0, 255, 0), singlePointColor=None, flags=2,
@@ -297,7 +298,7 @@ def match_images(img1, img2, detect=sift_detector()):
 def main():
     """Script entry point."""
     parser = argparse.ArgumentParser(description="Extract features.")
-    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/CMU1",
+    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/CMU2",
                         help="directory with the images to process.")
     args = parser.parse_args()
 
