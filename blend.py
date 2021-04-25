@@ -13,47 +13,8 @@ except ImportError:
 
 import cv2
 
-
-class SphProj:
-    """Forward and backward spherical projection."""
-
-    @staticmethod
-    def hom2proj(pts):
-        """Project the points in spherical coordinates."""
-        hypot = np.sqrt(pts[:, 0]**2 + pts[:, 2]**2)
-        return np.stack([np.arctan2(pts[:, 0], pts[:, 2]),
-                        np.arctan2(pts[:, 1], hypot)], axis=-1)
-
-    @staticmethod
-    def proj2hom(pts):
-        """Recover projective points from spherical coordinates."""
-        return np.stack([np.sin(pts[:, 0]), np.tan(pts[:, 1]),
-                         np.cos(pts[:, 0])], axis=-1)
-
-
-class CylProj:
-    """Forward and backward cylidrical projection."""
-
-    @staticmethod
-    def hom2proj(pts):
-        """Project the points in cylindrical coordinates."""
-        hypot = np.sqrt(pts[:, 0]**2 + pts[:, 2]**2)
-        return np.stack([np.arctan2(pts[:, 0], pts[:, 2]),
-                        pts[:, 1]/hypot], axis=-1)
-
-    @staticmethod
-    def proj2hom(pts):
-        """Recover projective points from cylindrical coordinates."""
-        return np.stack([np.sin(pts[:, 0]), pts[:, 1], np.cos(pts[:, 0])],
-                        axis=-1)
-
-
-def intrinsics(focal, center=(0, 0)):
-    """Intrinsic matrix from focal."""
-    if not isinstance(focal, (list, tuple)):
-        focal = (focal,)*2
-    return np.array(
-        [[focal[0], 0, center[0]], [0, focal[0], center[1]], [0, 0, 1]])
+from stitcher import SphProj
+from bundle_adj import intrinsics
 
 
 # from: https://gist.github.com/royshil/0b21e8e7c6c1f46a16db66c384742b2b
