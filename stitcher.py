@@ -147,7 +147,10 @@ def multiband_blend(patches, shape, n_levels=5):
     for idx, (warped, _, irange) in enumerate(patches):
         yrange, xrange = irange  # unpack to make numpy happy
         weights[yrange, xrange, idx] = warped[..., 3]
-    weights = weights.argmax(axis=-1)  # find maximum patch for each pixel
+    # find maximum patch for each pixel
+    valid = np.sum(weights, axis=-1) > 0
+    weights = weights.argmax(axis=-1)
+    weights[~valid] = -1
 
     # initialize sharp high-res masks for the patches
     for idx, (warped, _, irange) in enumerate(patches):
@@ -162,16 +165,22 @@ def multiband_blend(patches, shape, n_levels=5):
         wsum = np.zeros(shape, dtype="float32")
         is_last = lvl == (n_levels - 1)
 
+        # blur outside the valid region to reduce artifacts
+        #  but then remove invalid pixels
+        allmask = np.zeros(shape, dtype=bool)
         for idx, (warped, mask, irange) in enumerate(patches):
-            blurwarp = cv2.GaussianBlur(warped, (0, 0), sigma)
-            blurwarp = np.where(mask[..., None], 0.0, blurwarp)
-            prev = prevs[idx] if prevs[idx] is not None else warped
-            tile = blurwarp if is_last else (prev - blurwarp)
+            tile = prevs[idx] if prevs[idx] is not None else warped.copy()
+            if not is_last:
+                blurwarp = cv2.GaussianBlur(warped, (0, 0), sigma)
+                tile[..., :3] -= blurwarp[..., :3]
+                tile[..., 3] = blurwarp[..., 3]   # avoid sharp masks
+                prevs[idx] = blurwarp
 
-            layer[irange] += tile[..., :3] * prev[..., [3]]
-            wsum[irange] += prev[..., 3]
-            prevs[idx] = blurwarp
+            layer[irange] += tile[..., :3] * tile[..., [3]]
+            wsum[irange] += tile[..., 3]
+            allmask[irange] |= ~mask
 
+        layer[~allmask, :] = 0
         wsum[wsum == 0] = 1
         mosaic += layer / wsum[..., None]
 
@@ -218,6 +227,11 @@ def stitch(regions, blender=no_blend):
         bottom, top = bottom.astype(np.int32), top.astype(np.int32)
         hh_, ww_ = reg.img.shape[:2]  # original image shape
 
+        # pad image if multi-band to avoid sharp edges where the image ends
+        if blender == multiband_blend:
+            bottom = np.maximum(bottom - 10, np.int32([0, 0]))
+            top = np.minimum(top + 10, target.astype(np.int32))
+
         # find pixel coordinates
         y_i, x_i = np.indices((top[1]-bottom[1], top[0]-bottom[0]))
         x_i = (x_i + bottom[0]) * resolution[0] + im_range[0][0]
@@ -230,13 +244,13 @@ def stitch(regions, blender=no_blend):
         mask = xx_[..., -1] < 0  # behind the screen
 
         x_pr = xx_[..., :-1] / xx_[..., [-1]] + np.float32([ww_/2, hh_/2])
-        mask |= (x_pr[..., 0] < 0) | (x_pr[..., 0] >= ww_) | \
-                (x_pr[..., 1] < 0) | (x_pr[..., 1] >= hh_)
-        x_pr[mask] = -1
+        mask |= (x_pr[..., 0] < 0) | (x_pr[..., 0] > ww_-1) | \
+                (x_pr[..., 1] < 0) | (x_pr[..., 1] > hh_-1)
 
         # paste only valid pixels
         warped = cv2.remap(reg.img, x_pr[:, :, 0], x_pr[:, :, 1],
-                           cv2.INTER_AREA, borderMode=cv2.BORDER_CONSTANT)
+                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        warped[..., 3] = warped[..., 3] * (~mask)
         irange = np.s_[bottom[1]:top[1], bottom[0]:top[0]]
         patches.append((warped, mask, irange))
 
