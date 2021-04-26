@@ -1,7 +1,11 @@
-"""Stitches a set of images into a single panorama."""
+"""Stitches a set of images into a single panorama.
+
+Adapted from the C++ implementation in https://github.com/ppwwyyxx/OpenPano
+"""
 import argparse
 import logging
 import os
+import pickle
 
 import numpy as np
 import cv2
@@ -102,17 +106,113 @@ def estimate_resolution(regions):
     return resolution, (min_r, max_r)
 
 
-def stitch(regions):
+def no_blend(patches, shape):
+    """Paste the patches to the mosaic without blending."""
+    mosaic = np.zeros(shape + (3,), dtype=np.uint8)
+
+    for warped, mask, irange in patches:
+        mosaic[irange] = np.where(mask[..., None], mosaic[irange],
+                                  (255 * warped[..., :3]).astype(np.uint8))
+
+    return mosaic
+
+
+def linear_blend(patches, shape):
+    """Linearly blend patches."""
+    mosaic = np.zeros(shape + (3,), dtype="float32")
+    wsum = np.zeros(shape, dtype="float32")  # normalization
+    for warped, mask, irange in patches:
+        tile = np.where(mask[..., None], 0.0, warped[..., :3])
+        mosaic[irange] += tile * warped[..., [3]]
+        wsum[irange] += warped[..., 3]
+
+    wsum[wsum == 0] = 1   # avoid division by zero
+    mosaic /= wsum[..., None]
+
+    return (255 * mosaic).astype(np.uint8)
+
+
+def multiband_blend(patches, shape, n_levels=5):
+    """
+    Use multi-band blending [1] to merge patches.
+
+    References
+    ----------
+    [1] Brown, Matthew, and David G. Lowe. "Automatic panoramic image stitching
+    using invariant features." International journal of computer vision 74.1
+    (2007): 59-73.
+    """
+    weights = np.zeros(shape + (len(patches),), dtype="float32")
+
+    for idx, (warped, _, irange) in enumerate(patches):
+        yrange, xrange = irange  # unpack to make numpy happy
+        weights[yrange, xrange, idx] = warped[..., 3]
+    weights = weights.argmax(axis=-1)  # find maximum patch for each pixel
+
+    # initialize sharp high-res masks for the patches
+    for idx, (warped, _, irange) in enumerate(patches):
+        warped[..., 3] = weights[irange] == idx
+
+    mosaic = np.zeros(shape + (3,), dtype="float32")
+    prevs = [None] * len(patches)
+    for lvl in range(n_levels):
+        logging.debug(f"Blending level #{lvl + 1}")
+        sigma = np.sqrt(2*lvl + 1.0)*4
+        layer = np.zeros(shape + (3,), dtype="float32")  # delta for this level
+        wsum = np.zeros(shape, dtype="float32")
+        is_last = lvl == (n_levels - 1)
+
+        for idx, (warped, mask, irange) in enumerate(patches):
+            blurwarp = cv2.GaussianBlur(warped, (0, 0), sigma)
+            blurwarp = np.where(mask[..., None], 0.0, blurwarp)
+            prev = prevs[idx] if prevs[idx] is not None else warped
+            tile = blurwarp if is_last else (prev - blurwarp)
+
+            layer[irange] += tile[..., :3] * prev[..., [3]]
+            wsum[irange] += prev[..., 3]
+            prevs[idx] = blurwarp
+
+        wsum[wsum == 0] = 1
+        mosaic += layer / wsum[..., None]
+
+    mosaic = np.clip(mosaic, 0.0, 1.0)   # avoid saturation artifacts
+    return (255 * mosaic).astype(np.uint8)
+
+
+BLENDERS = {
+    "none": no_blend,
+    "linear": linear_blend,
+    "multiband": multiband_blend
+}
+
+
+def _hat(size):
+    """Triangular function 0-0.5-0 of a given size."""
+    xx_ = np.arange(size) - size/2
+    return 0.5 - np.abs(xx_ / size)
+
+
+def _add_weights(img):
+    """Add weights scaled as (x-0.5)*(y-0.5) in normalized coordinates."""
+    img = cv2.cvtColor(img.astype(np.float32) / 255, cv2.COLOR_RGB2RGBA)
+    height, width = img.shape[:2]
+    img[..., 3] = _hat(height)[:, None] * _hat(width)[None, :]
+
+    return img
+
+
+def stitch(regions, blender=no_blend):
     """Stitch the images together."""
     for reg in regions:
         reg.range = _proj_img_range_border(reg.img.shape[:2], reg.hom())
+        reg.img = _add_weights(reg.img)
 
     resolution, im_range = estimate_resolution(regions)
     target = (im_range[1] - im_range[0]) / resolution
 
     shape = tuple(int(t) for t in np.round(target))[::-1]  # y,x order
-    mosaic = np.zeros(shape + (3,), dtype=np.uint8)        # RGBA image
-    for idx, reg in enumerate(regions):
+    patches = []
+    for reg in regions:
         bottom = np.round((reg.range[0] - im_range[0])/resolution)
         top = np.round((reg.range[1] - im_range[0])/resolution)
         bottom, top = bottom.astype(np.int32), top.astype(np.int32)
@@ -137,11 +237,10 @@ def stitch(regions):
         # paste only valid pixels
         warped = cv2.remap(reg.img, x_pr[:, :, 0], x_pr[:, :, 1],
                            cv2.INTER_AREA, borderMode=cv2.BORDER_CONSTANT)
-        tile = mosaic[bottom[1]:top[1], bottom[0]:top[0]]
-        mosaic[bottom[1]:top[1], bottom[0]:top[0]] = np.where(
-            mask[..., None], tile, warped)
+        irange = np.s_[bottom[1]:top[1], bottom[0]:top[0]]
+        patches.append((warped, mask, irange))
 
-    return mosaic
+    return blender(patches, shape)
 
 
 def idx_to_keypoints(matches, kpts):
@@ -167,6 +266,13 @@ def main():
     parser = argparse.ArgumentParser(description="Stitch images.")
     parser.add_argument('--path', type=str, default="../data/ppwwyyxx/CMU2",
                         help="directory with the images to process.")
+    parser.add_argument("--noba", action="store_true",
+                        help="Disable the bundle adjustment step.")
+    parser.add_argument("-b", "--blend", default='multiband',
+                        choices=list(BLENDERS.keys()),
+                        help="blending algorithm.")
+    parser.add_argument("-o", "--out", type=str,
+                        help="save result to this file")
     args = parser.parse_args()
 
     exts = [".jpg", ".png", ".bmp"]
@@ -186,10 +292,20 @@ def main():
         kpts, matches = matching(imgs)
         np.savez(f"matches_{name}.npz", kpts=kpts, matches=matches)
 
-    regions = traverse(imgs, idx_to_keypoints(matches, kpts))
-    mosaic = stitch(regions)
-    cv2.imshow("Mosaic", mosaic)
+    try:
+        with open(f"ba_{name}.pkl", 'rb') as fid:
+            regions = pickle.load(fid)
+    except IOError:
+        regions = traverse(imgs, idx_to_keypoints(matches, kpts),
+                           use_ba=not args.noba)
+        with open(f"ba_{name}.pkl", 'wb') as fid:
+            pickle.dump(regions, fid, protocol=pickle.HIGHEST_PROTOCOL)
 
+    mosaic = stitch(regions, blender=BLENDERS[args.blend])
+    if args.out:
+        cv2.imwrite(args.out, mosaic)
+
+    cv2.imshow("Mosaic", mosaic)
     if cv2.waitKey(0) & 0xff == 27:
         cv2.destroyAllWindows()
 

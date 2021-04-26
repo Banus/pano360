@@ -146,7 +146,7 @@ def residuals(cameras, matches):
     for i, j, match in matches:
         hom = _hom_to_from(cameras[j], cameras[i])
         trans = hom.dot(match[:, 3:6].T)
-        res.append((trans / trans[[-1], :] - match[:, :3].T)[:-1])
+        res.append((match[:, :3].T - trans / trans[[-1], :])[:-1])
     return np.concatenate(res, axis=1).ravel()
 
 
@@ -337,7 +337,7 @@ class IncrementalBundleAdjuster:
         logging.debug(f"Final error: {best_err}")
 
 
-def traverse(imgs, matches, use_straighten=True):
+def traverse(imgs, matches, use_ba=True, use_straighten=True):
     """Traverse connected matches by visiting the best matches first."""
     # find starting point
     idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
@@ -345,7 +345,7 @@ def traverse(imgs, matches, use_straighten=True):
     src = idx[np.argmax(scores)]
     intr = intrinsics(np.median([get_focal(hom) for hom in homs]))
 
-    iba = IncrementalBundleAdjuster(len(imgs))
+    iba = IncrementalBundleAdjuster(len(imgs), incremenntal=use_ba)
     iba.cameras[src] = Image(None, np.eye(3), intr)
 
     qq_ = [(-matches[src][j][2], src, j) for j in matches[src].keys()]
