@@ -305,6 +305,7 @@ class IncrementalBundleAdjuster:
         idx = [i for i, c in enumerate(self.cameras) if c is not None]
         errs = residuals(self.cameras, self.matches)
         best_err = loss(errs)
+        logging.debug(f"Optimizing {len(idx)} cameras")
         logging.debug(f"Initial error: {best_err}")
 
         n_not_improved = 0   # exit loop if the loss doesn't improve

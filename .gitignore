@@ -1,2 +1,6 @@
 __pycache__
 .vscode
+*.npz
+*.pkl
+*.jpg
+*.png

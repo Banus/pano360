@@ -4,7 +4,7 @@ import numpy as np
 import numpy.testing as npt
 
 import bundle_adj as ba
-from stitcher import SphProj, CylProj
+from stitcher import SphProj, CylProj, find_gains
 
 
 class TestHomography(unittest.TestCase):
@@ -75,6 +75,25 @@ class TestWarp(unittest.TestCase):
         new_pts = CylProj.proj2hom(CylProj.hom2proj(pts))
         new_pts /= np.linalg.norm(new_pts, axis=1, keepdims=True)
         npt.assert_almost_equal(new_pts, pts)
+
+    @staticmethod
+    def test_gain_correction():
+        """Checks that the real gains are correctly recovered."""
+        size = 10
+        gains = 1 + 0.1 * np.random.randn(size)
+        overlaps = 100 + 10 * np.random.randn(size, size)
+        # simulate random voerlaps with consisten gain differences
+        for i in range(size):
+            for j in range(i+1, size):
+                overlaps[i, j] = overlaps[j, i] * gains[j] / gains[i]
+
+        # sanity check: verify that gains is the solution
+        npt.assert_almost_equal(gains[:, None] * overlaps,
+                                gains[None, :] * overlaps.T)
+
+        sizes = np.random.randn(size, size) + 10
+        ratio = find_gains(overlaps, sizes) / gains
+        npt.assert_almost_equal(ratio, np.full(size, ratio[0]))
 
 
 if __name__ == '__main__':

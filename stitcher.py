@@ -11,9 +11,58 @@ import numpy as np
 import cv2
 
 from features import matching
-from bundle_adj import traverse
+from bundle_adj import _hom_to_from, traverse
 
 MAX_RESOLUTION = 1400
+
+
+#
+# Exposure adjustment
+#
+
+def find_gains(overlaps, sizes, stdn=0.1, stdg=2):
+    """Find the gains minimizing discrepancies between mean intensities.
+
+    Solving eq (29) in [1].
+    """
+    nsize1, nsize2 = (sizes+sizes.T)/(stdn*stdn), sizes/(stdg*stdg)
+    aa_ = np.diag(np.sum(nsize1 * overlaps * overlaps + nsize2, axis=1))
+    aa_ -= nsize1 * overlaps * overlaps.T
+
+    return np.linalg.solve(aa_, np.sum(nsize2, axis=1))
+
+
+def equalize_gains(regions):
+    """Equalize the exposures by minimizing differences on overlaps."""
+    n_imgs = len(regions)
+    overlaps, sizes = np.zeros((n_imgs, n_imgs)), np.zeros((n_imgs, n_imgs))
+
+    height, width = regions[0].img.shape[:2]
+    tr_ = np.array([[1, 0, width/2], [0, 1, height/2], [0, 0, 1]])
+    inv_tr = np.array([[1, 0, -width/2], [0, 1, -height/2], [0, 0, 1]])
+    corners = np.array([[0, 0, 1], [width, 0, 1],
+                        [width, height, 1], [0, height, 1]])
+
+    logging.debug("Equalizing gain...")
+    for i in range(n_imgs):
+        for j in range(i+1, n_imgs):
+            # translate image to (non-centered) pixel coordinates
+            hom = tr_.dot(_hom_to_from(regions[i], regions[j])).dot(inv_tr)
+            pts = hom.dot(corners.T).T
+
+            if np.any(pts[:, 2] < 0):   # behind the screen, skip
+                continue
+            overlap = cv2.warpPerspective(regions[j].img, hom, (width, height),
+                                          borderMode=cv2.BORDER_TRANSPARENT)
+            mask = overlap[..., 3] != 0
+            sizes[i, j] = sizes[j, i] = np.sum(mask)
+            if sizes[i, j] == 0:  # no overlap
+                continue
+            overlaps[i, j] = np.mean(regions[i].img[mask, :3])
+            overlaps[j, i] = np.mean(overlap[mask, :3])
+
+    for reg, gain in zip(regions, find_gains(overlaps, sizes)):
+        reg.img[..., :3] = np.clip(gain * reg.img[..., :3], 0, 1)
 
 
 #
@@ -210,11 +259,14 @@ def _add_weights(img):
     return img
 
 
-def stitch(regions, blender=no_blend):
+def stitch(regions, blender=no_blend, equalize=False):
     """Stitch the images together."""
     for reg in regions:
         reg.range = _proj_img_range_border(reg.img.shape[:2], reg.hom())
         reg.img = _add_weights(reg.img)
+
+    if equalize:
+        equalize_gains(regions)
 
     resolution, im_range = estimate_resolution(regions)
     target = (im_range[1] - im_range[0]) / resolution
@@ -278,10 +330,14 @@ def idx_to_keypoints(matches, kpts):
 def main():
     """Script entry point."""
     parser = argparse.ArgumentParser(description="Stitch images.")
-    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/CMU2",
+    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/uav",
                         help="directory with the images to process.")
+    parser.add_argument("-s", "--shrink", type=float, default=2,
+                        help="downsample the images by this amount.")
     parser.add_argument("--noba", action="store_true",
-                        help="Disable the bundle adjustment step.")
+                        help="disable the bundle adjustment step.")
+    parser.add_argument("--equalize", "-e", action="store_true",
+                        help="equalize image gain before stitching.")
     parser.add_argument("-b", "--blend", default='multiband',
                         choices=list(BLENDERS.keys()),
                         help="blending algorithm.")
@@ -292,12 +348,14 @@ def main():
     exts = [".jpg", ".png", ".bmp"]
     exts += [ex.upper() for ex in exts]
 
-    name = os.path.basename(args.path)
+    name = f"{os.path.basename(args.path)}_s{args.shrink}"
     files = [f for f in os.listdir(args.path)
              if any([f.endswith(ext) for ext in exts])]
 
     imgs = [cv2.imread(os.path.join(args.path, f)) for f in files]
-    imgs = [cv2.resize(im, None, fx=0.5, fy=0.5) for im in imgs]
+    if args.shrink > 1:
+        imgs = [cv2.resize(im, None, fx=1/args.shrink, fy=1/args.shrink)
+                for im in imgs]
 
     try:  # cache
         arr = np.load(f"matches_{name}.npz", allow_pickle=True)
@@ -315,7 +373,8 @@ def main():
         with open(f"ba_{name}.pkl", 'wb') as fid:
             pickle.dump(regions, fid, protocol=pickle.HIGHEST_PROTOCOL)
 
-    mosaic = stitch(regions, blender=BLENDERS[args.blend])
+    mosaic = stitch(regions, blender=BLENDERS[args.blend],
+                    equalize=args.equalize)
     if args.out:
         cv2.imwrite(args.out, mosaic)
 
