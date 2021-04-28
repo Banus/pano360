@@ -146,8 +146,8 @@ def residuals(cameras, matches):
     for i, j, match in matches:
         hom = _hom_to_from(cameras[j], cameras[i])
         trans = hom.dot(match[:, 3:6].T)
-        res.append((match[:, :3].T - trans / trans[[-1], :])[:-1])
-    return np.concatenate(res, axis=1).ravel()
+        res.append((match[:, :3].T - trans / trans[[-1], :])[:-1].ravel())
+    return np.concatenate(res, axis=0)
 
 
 def loss(res):
@@ -283,11 +283,11 @@ def _jacobian_numeric(cameras, matches):
 class IncrementalBundleAdjuster:
     """Bundle adjustment one image at a time."""
 
-    def __init__(self, n_cameras, incremenntal=True):
+    def __init__(self, n_cameras, mode="incr"):
         """Set bundler parameters."""
         self.cameras = [None] * n_cameras
         self.matches = []
-        self.is_incremental = incremenntal
+        self.mode = mode
 
     def add(self, idx, camera, matches):
         """Add a new camerato the bundler."""
@@ -297,7 +297,7 @@ class IncrementalBundleAdjuster:
                 continue
             self.matches.append((new, idx, matches[idx][new][0]))
 
-        if self.is_incremental:
+        if self.mode == "incr":
             self.optimize()
 
     def optimize(self):
@@ -338,7 +338,7 @@ class IncrementalBundleAdjuster:
         logging.debug(f"Final error: {best_err}")
 
 
-def traverse(imgs, matches, use_ba=True, use_straighten=True):
+def traverse(imgs, matches, badjust="incr", use_straighten=True):
     """Traverse connected matches by visiting the best matches first."""
     # find starting point
     idx, homs, scores = zip(*[(i, *matches[i][j][1:3]) for i in matches.keys()
@@ -346,7 +346,7 @@ def traverse(imgs, matches, use_ba=True, use_straighten=True):
     src = idx[np.argmax(scores)]
     intr = intrinsics(np.median([get_focal(hom) for hom in homs]))
 
-    iba = IncrementalBundleAdjuster(len(imgs), incremenntal=use_ba)
+    iba = IncrementalBundleAdjuster(len(imgs), mode=badjust)
     iba.cameras[src] = Image(None, np.eye(3), intr)
 
     qq_ = [(-matches[src][j][2], src, j) for j in matches[src].keys()]
@@ -370,6 +370,9 @@ def traverse(imgs, matches, use_ba=True, use_straighten=True):
         for new in matches[dst].keys():
             heapq.heappush(qq_, (-matches[dst][new][2], dst, new))
 
+    if badjust == "last":
+        iba.optimize()
+
     # images are needed only for stitching, add after optimization
     cameras = iba.cameras
     for idx, img in enumerate(imgs):
@@ -378,8 +381,7 @@ def traverse(imgs, matches, use_ba=True, use_straighten=True):
 
     cameras = [c for c in cameras if c is not None]
     if use_straighten:
-        rots = [c.rot for c in cameras if c is not None]
-        rots = straighten(rots)
+        rots = straighten([c.rot for c in cameras if c is not None])
         for cam, rot in zip(cameras, rots):
             cam.rot = rot
 

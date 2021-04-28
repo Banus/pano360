@@ -15,7 +15,7 @@ def profile(fun):
 
     strm = io.StringIO()
     stats = pstats.Stats(prof, stream=strm).sort_stats(SortKey.CUMULATIVE)
-    stats.print_stats()
+    stats.print_stats(.1)
     print(strm.getvalue())
 
 

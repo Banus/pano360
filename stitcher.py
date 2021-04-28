@@ -205,6 +205,10 @@ def multiband_blend(patches, shape, n_levels=5):
     for idx, (warped, _, irange) in enumerate(patches):
         warped[..., 3] = weights[irange] == idx
 
+    # blur outside the valid region to reduce artifacts
+    #  but then remove invalid pixels - compute only the first time
+    allmask = np.zeros(shape, dtype=bool)
+
     mosaic = np.zeros(shape + (3,), dtype="float32")
     prevs = [None] * len(patches)
     for lvl in range(n_levels):
@@ -214,9 +218,6 @@ def multiband_blend(patches, shape, n_levels=5):
         wsum = np.zeros(shape, dtype="float32")
         is_last = lvl == (n_levels - 1)
 
-        # blur outside the valid region to reduce artifacts
-        #  but then remove invalid pixels
-        allmask = np.zeros(shape, dtype=bool)
         for idx, (warped, mask, irange) in enumerate(patches):
             tile = prevs[idx] if prevs[idx] is not None else warped.copy()
             if not is_last:
@@ -227,7 +228,8 @@ def multiband_blend(patches, shape, n_levels=5):
 
             layer[irange] += tile[..., :3] * tile[..., [3]]
             wsum[irange] += tile[..., 3]
-            allmask[irange] |= ~mask
+            if lvl == 0:
+                allmask[irange] |= ~mask
 
         layer[~allmask, :] = 0
         wsum[wsum == 0] = 1
@@ -259,7 +261,15 @@ def _add_weights(img):
     return img
 
 
-def stitch(regions, blender=no_blend, equalize=False):
+def _valid(patches, shape):
+    """Area of validity (for crop)."""
+    valid = np.zeros(shape, dtype=bool)
+    for _, mask, irange in patches:
+        valid[irange] |= ~mask
+    return valid
+
+
+def stitch(regions, blender=no_blend, equalize=False, crop=False):
     """Stitch the images together."""
     for reg in regions:
         reg.range = _proj_img_range_border(reg.img.shape[:2], reg.hom())
@@ -306,7 +316,55 @@ def stitch(regions, blender=no_blend, equalize=False):
         irange = np.s_[bottom[1]:top[1], bottom[0]:top[0]]
         patches.append((warped, mask, irange))
 
-    return blender(patches, shape)
+    mosaic = blender(patches, shape)
+    if crop:
+        logging.debug("Cropping...")
+        valid = _valid(patches, shape)
+        mosaic = crop_mosaic(mosaic, valid)
+
+    return mosaic
+
+
+def try_jit(*args, **kwargs):
+    """Fall back to Python if Numba is not installed."""
+    try:
+        import numba
+        return lambda f: numba.jit(f, *args, **kwargs)
+    except ImportError:
+        pass
+    return lambda func: func
+
+
+@try_jit(nopython=True, parallel=True, fastmath=True, cache=True)
+def crop_mosaic(mosaic, valid):
+    """Remove the black borders from the stitched image.
+
+    Optimized in Numba; the first run will be slower.
+    """
+    height, width = valid.shape
+    heights = np.zeros(width, dtype=np.int32)
+    lefts = np.zeros(width, dtype=np.int32)
+    rights = np.zeros(width, dtype=np.int32)
+
+    area = 0
+    for i in range(height):
+        for j in range(width):
+            heights[j] = (heights[j] + 1) if valid[i, j] else 0
+        for j in range(width):
+            lefts[j] = j
+            while lefts[j] > 0 and heights[j] <= heights[lefts[j]-1]:
+                lefts[j] = lefts[lefts[j] - 1]
+        for j in range(width - 1, 0, -1):
+            rights[j] = j
+            while rights[j] < width - 1 and heights[j] <= heights[rights[j]+1]:
+                rights[j] = rights[rights[j] + 1]
+        for j in range(width):
+            new_area = max(area, (rights[j] - lefts[j] + 1) * heights[j])
+            if new_area > area:
+                area = new_area
+                ll, rr, hh, last = lefts[j], rights[j], heights[j], i
+
+    return mosaic[last-hh+1:last+1, ll:rr+1, :]
 
 
 def idx_to_keypoints(matches, kpts):
@@ -334,10 +392,13 @@ def main():
                         help="directory with the images to process.")
     parser.add_argument("-s", "--shrink", type=float, default=2,
                         help="downsample the images by this amount.")
-    parser.add_argument("--noba", action="store_true",
-                        help="disable the bundle adjustment step.")
+    parser.add_argument("--ba", default="incr",
+                        choices=["none", "incr", "last"],
+                        help="bundle adjustment type.")
     parser.add_argument("--equalize", "-e", action="store_true",
                         help="equalize image gain before stitching.")
+    parser.add_argument("--crop", "-c", action="store_true",
+                        help="remove the black borders.")
     parser.add_argument("-b", "--blend", default='multiband',
                         choices=list(BLENDERS.keys()),
                         help="blending algorithm.")
@@ -369,12 +430,13 @@ def main():
             regions = pickle.load(fid)
     except IOError:
         regions = traverse(imgs, idx_to_keypoints(matches, kpts),
-                           use_ba=not args.noba)
+                           badjust=args.ba)
         with open(f"ba_{name}.pkl", 'wb') as fid:
             pickle.dump(regions, fid, protocol=pickle.HIGHEST_PROTOCOL)
 
     mosaic = stitch(regions, blender=BLENDERS[args.blend],
-                    equalize=args.equalize)
+                    equalize=args.equalize, crop=args.crop)
+
     if args.out:
         cv2.imwrite(args.out, mosaic)
 
@@ -385,4 +447,5 @@ def main():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
+    logging.getLogger('numba').setLevel(logging.WARNING)  # silence Numba
     main()
