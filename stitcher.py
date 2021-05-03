@@ -390,8 +390,7 @@ def idx_to_keypoints(matches, kpts):
 def main():
     """Script entry point."""
     parser = argparse.ArgumentParser(description="Stitch images.")
-    parser.add_argument('-p', '--path', type=str,
-                        default="../data/ppwwyyxx/NSH",
+    parser.add_argument('path', type=str,
                         help="directory with the images to process.")
     parser.add_argument("-s", "--shrink", type=float, default=2,
                         help="downsample the images by this amount.")
@@ -402,7 +401,7 @@ def main():
                         help="equalize image gain before stitching.")
     parser.add_argument("--crop", "-c", action="store_true",
                         help="remove the black borders.")
-    parser.add_argument("-b", "--blend", default='multiband',
+    parser.add_argument("--blend", "-b", default='multiband',
                         choices=list(BLENDERS.keys()),
                         help="blending algorithm.")
     parser.add_argument("-o", "--out", type=str,
@@ -412,7 +411,7 @@ def main():
     exts = [".jpg", ".png", ".bmp"]
     exts += [ex.upper() for ex in exts]
 
-    name = f"{os.path.basename(args.path)}_s{args.shrink}"
+    name = f"{os.path.basename(os.path.normpath(args.path))}_s{args.shrink}"
     files = [f for f in os.listdir(args.path)
              if any([f.endswith(ext) for ext in exts])]
 
