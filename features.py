@@ -6,6 +6,7 @@ import argparse
 import logging
 import math
 import os
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -243,7 +244,7 @@ def _match_hom(pt1, pt2, des1, des2):
     hom, mask = cv2.findHomography(query_pts, train_pts, cv2.RANSAC)
     mask = (mask != 0).squeeze()    # boolean mask
 
-    return match[mask].squeeze(), hom
+    return match[mask, :], hom
 
 
 def _reverse(match, hom):
@@ -254,6 +255,7 @@ def _reverse(match, hom):
 def matching(imgs, detect=sift_detector()):
     """Find correspondences between images in a list."""
     kpts, descs = [], []
+    start = time.time()
     for i, img in enumerate(imgs):
         logging.debug(f"Processing image #{i+1}")
 
@@ -261,9 +263,11 @@ def matching(imgs, detect=sift_detector()):
         cent = np.array([img.shape[1], img.shape[0]]) / 2
         kpts.append(np.float32([kp.pt - cent for kp in kp_]))
         descs.append(des)
+    logging.info(f"Extracted keypoints, time: {time.time() - start}")
 
     # match all possible pairs
     matches, n_imgs = defaultdict(dict), len(imgs)
+    start = time.time()
     for src in range(n_imgs):
         for dst in range(src+1, n_imgs):
             logging.debug(f"Matching {src+1}-{dst+1}")
@@ -274,6 +278,7 @@ def matching(imgs, detect=sift_detector()):
 
             matches[src][dst] = (match, hom)
             matches[dst][src] = _reverse(match, hom)
+    logging.info(f"Matched features, time: {time.time() - start}")
 
     return np.array(kpts, dtype=np.object), np.array(matches, dtype=np.object)
 

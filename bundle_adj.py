@@ -10,7 +10,9 @@ PARAMS_PER_CAMERA = 6
 TERMS_PER_MATCH = 2
 # Levenberg–Marquardt parameters
 LM_LAMBDA = 5         # regularization strenght
-LM_MAX_ITER = 10      # maximum number of iterations
+LM_MAX_ITER = 100     # maximum number of iterations
+# remove matches with this initial error - they are likely mismatches
+MIN_MATCH_ERROR = 150
 
 
 @dataclass
@@ -140,13 +142,16 @@ def camera_to_params(camera):
     return np.concatenate([params, mat_to_angle(camera.rot)])
 
 
+def get_diff(cam1, cam2, match):
+    """Get the residual for a given match."""
+    hom = _hom_to_from(cam1, cam2)
+    trans = hom.dot(match[:, 3:6].T)
+    return (match[:, :3].T - trans / trans[[-1], :])[:-1].ravel()
+
+
 def residuals(cameras, matches):
     """Find estimation errors."""
-    res = []
-    for i, j, match in matches:
-        hom = _hom_to_from(cameras[j], cameras[i])
-        trans = hom.dot(match[:, 3:6].T)
-        res.append((match[:, :3].T - trans / trans[[-1], :])[:-1].ravel())
+    res = [get_diff(cameras[j], cameras[i], m) for i, j, m in matches]
     return np.concatenate(res, axis=0)
 
 
@@ -191,7 +196,7 @@ def _jacobian_symbolic(cameras, matches):
 
     # cache rotation derivatives
     drs = [dr_dvi(cameras[i].rot) for i in cam_idx]
-    for idx, (i, j, match) in enumerate(matches):
+    for idx, (j, i, match) in enumerate(matches):
         m_slice = slice(m_offs[idx]*TERMS_PER_MATCH,
                         m_offs[idx+1]*TERMS_PER_MATCH)
 
@@ -241,14 +246,14 @@ def _jacobian_symbolic(cameras, matches):
         i_slice = slice(c_off_i, c_off_i+PARAMS_PER_CAMERA)
         j_slice = slice(c_off_j, c_off_j+PARAMS_PER_CAMERA)
 
-        jac_t_jac[i_slice, i_slice] = \
+        jac_t_jac[i_slice, i_slice] += \
             jac[m_slice, i_slice].T.dot(jac[m_slice, i_slice])
-        jac_t_jac[j_slice, j_slice] = \
+        jac_t_jac[j_slice, j_slice] += \
             jac[m_slice, j_slice].T.dot(jac[m_slice, j_slice])
 
         cross_block = jac[m_slice, i_slice].T.dot(jac[m_slice, j_slice])
-        jac_t_jac[i_slice, j_slice] = cross_block
-        jac_t_jac[j_slice, i_slice] = cross_block.T
+        jac_t_jac[i_slice, j_slice] += cross_block
+        jac_t_jac[j_slice, i_slice] += cross_block.T
 
     return jac, jac_t_jac
 
@@ -290,12 +295,15 @@ class IncrementalBundleAdjuster:
         self.mode = mode
 
     def add(self, idx, camera, matches):
-        """Add a new camerato the bundler."""
+        """Add a new camera to the bundler."""
         self.cameras[idx] = camera
         for new, cam in enumerate(self.cameras):
             if cam is None or new not in matches[idx]:
                 continue
-            self.matches.append((new, idx, matches[idx][new][0]))
+            match = matches[idx][new][0]
+            if loss(get_diff(camera, cam, match)) > MIN_MATCH_ERROR:
+                continue
+            self.matches.append((new, idx, match))
 
         if self.mode == "incr":
             self.optimize()
@@ -311,8 +319,7 @@ class IncrementalBundleAdjuster:
         n_not_improved = 0   # exit loop if the loss doesn't improve
         for it_ in range(LM_MAX_ITER):
             # Levenberg–Marquardt iteration
-            jac, jac_t_jac = _jacobian_numeric(self.cameras, self.matches)
-
+            jac, jac_t_jac = _jacobian_symbolic(self.cameras, self.matches)
             bb_ = jac.T.dot(errs)
             jac_t_jac += np.eye(jac.shape[1]) * LM_LAMBDA
 
@@ -327,7 +334,7 @@ class IncrementalBundleAdjuster:
 
             errs = residuals(cams, self.matches)
             err = loss(errs)
-            if err < best_err - 1e-6:
+            if err < best_err - 1e-3:
                 best_err = err
                 self.cameras = cams
             else:

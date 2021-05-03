@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import pickle
+import time
 
 import numpy as np
 import cv2
@@ -146,7 +147,8 @@ def estimate_resolution(regions):
 
     mid = regions[len(regions) // 2]   # central image
     im_shape = np.array(mid.img.shape[:2][::-1])
-    resolution = (mid.range[1] - mid.range[0]) / im_shape
+    mid_range = _proj_img_range_corners(mid.img.shape[:2], mid.hom())
+    resolution = (mid_range[1] - mid_range[0]) / im_shape
 
     max_side = np.max(size / resolution)
     if max_side > MAX_RESOLUTION:
@@ -369,8 +371,8 @@ def crop_mosaic(mosaic, valid):
 
 def idx_to_keypoints(matches, kpts):
     """Replace keypoint indices with their coordinates."""
-    def _i_to_k(matches, kpt1, kpt2):
-        return np.concatenate([kpt1[matches[:, 0]], kpt2[matches[:, 1]]],
+    def _i_to_k(match, kpt1, kpt2):
+        return np.concatenate([kpt1[match[:, 0]], kpt2[match[:, 1]]],
                               axis=1)
 
     # homogeneous coordinates
@@ -388,7 +390,8 @@ def idx_to_keypoints(matches, kpts):
 def main():
     """Script entry point."""
     parser = argparse.ArgumentParser(description="Stitch images.")
-    parser.add_argument('--path', type=str, default="../data/ppwwyyxx/uav",
+    parser.add_argument('-p', '--path', type=str,
+                        default="../data/ppwwyyxx/NSH",
                         help="directory with the images to process.")
     parser.add_argument("-s", "--shrink", type=float, default=2,
                         help="downsample the images by this amount.")
@@ -429,13 +432,17 @@ def main():
         with open(f"ba_{name}.pkl", 'rb') as fid:
             regions = pickle.load(fid)
     except IOError:
+        start = time.time()
         regions = traverse(imgs, idx_to_keypoints(matches, kpts),
                            badjust=args.ba)
+        logging.info(f"Image registration, time: {time.time() - start}")
         with open(f"ba_{name}.pkl", 'wb') as fid:
             pickle.dump(regions, fid, protocol=pickle.HIGHEST_PROTOCOL)
 
+    start = time.time()
     mosaic = stitch(regions, blender=BLENDERS[args.blend],
                     equalize=args.equalize, crop=args.crop)
+    logging.info(f"Built mosaic, time: {time.time() - start}")
 
     if args.out:
         cv2.imwrite(args.out, mosaic)
